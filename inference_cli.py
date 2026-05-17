@@ -46,6 +46,7 @@ Model Support:
 # Standard library imports
 import sys
 import os
+import tempfile
 import argparse
 import time
 import platform
@@ -105,6 +106,10 @@ else:
                 os.environ["CUDA_VISIBLE_DEVICES"] = device_list_env[0]
 
 # Heavy dependency imports after environment configuration
+# Disable libuv before importing torch - ComfyUI portable PyTorch lacks libuv support.
+# Must be set before first torch import so spawned processes inherit it.
+os.environ.setdefault("USE_LIBUV", "0")
+
 import torch
 import cv2
 import numpy as np
@@ -512,13 +517,32 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
         
         # Multi-GPU: workers stream their own segments
         if len(device_list) > 1:
-            cap.release()  # Workers will reopen
-            video_info = {
-                'video_path': input_path,
-                'start_frame': args.skip_first_frames,
-                'frames_to_process': frames_to_process,
-            }
-            result = _gpu_processing(None, device_list, args, video_info=video_info)
+            fsdp_mode = hasattr(args, 'fsdp') and args.fsdp
+            if fsdp_mode:
+                # FSDP mode: load all frames, all GPUs process together with sharded model
+                cap.release()
+                # Read all frames at once for FSDP
+                frames = []
+                cap = cv2.VideoCapture(input_path)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, args.skip_first_frames)
+                for _ in range(frames_to_process):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                    frames.append(frame)
+                cap.release()
+                frames_tensor = torch.from_numpy(np.stack(frames)).to(torch.float16)
+                result = _gpu_processing(frames_tensor, device_list, args, fsdp_mode=True)
+            else:
+                # Standard multi-GPU: each GPU processes different frames
+                cap.release()  # Workers will reopen
+                video_info = {
+                    'video_path': input_path,
+                    'start_frame': args.skip_first_frames,
+                    'frames_to_process': frames_to_process,
+                }
+                result = _gpu_processing(None, device_list, args, video_info=video_info)
             
             # Save result
             if is_png:
@@ -579,7 +603,10 @@ def process_single_file(input_path: str, args: argparse.Namespace, device_list: 
     
     processing_start = time.time()
     # Process frames (multiprocessing only for multi-GPU)
-    if len(device_list) > 1:
+    fsdp_mode = hasattr(args, 'fsdp') and args.fsdp
+    if len(device_list) > 1 and fsdp_mode:
+        result = _gpu_processing(frames_tensor, device_list, args, fsdp_mode=True)
+    elif len(device_list) > 1:
         result = _gpu_processing(frames_tensor, device_list, args)
     else:
         result = _single_gpu_direct_processing(frames_tensor, args, device_list[0], runner_cache)
@@ -908,11 +935,37 @@ def _process_frames_core(
     
     # Prepare runner with caching support
     model_dir = args.model_dir if args.model_dir is not None else f"./models/{SEEDVR2_FOLDER_NAME}"
+
+    # Apply temporal window settings if requested
+    # This must be set BEFORE model loading so the window functions use the flags
+    from src.models.dit_7b.window import set_temporal_window_isolation as set_temporal_isolation_7b
+    from src.models.dit_3b.window import set_temporal_window_isolation as set_temporal_isolation_3b
+    from src.models.dit_7b.window import set_temporal_window_size_cap as set_temporal_cap_7b
+    from src.models.dit_3b.window import set_temporal_window_size_cap as set_temporal_cap_3b
     
+    if args.temporal_window_isolation:
+        set_temporal_isolation_7b(True)
+        set_temporal_isolation_3b(True)
+        debug.log("Temporal window isolation ENABLED - cross-window temporal propagation disabled",
+                  category="setup", force=True)
+    else:
+        set_temporal_isolation_7b(False)
+        set_temporal_isolation_3b(False)
+    
+    if args.temporal_window_size > 0:
+        set_temporal_cap_7b(args.temporal_window_size)
+        set_temporal_cap_3b(args.temporal_window_size)
+        debug.log(f"Temporal window size cap set to {args.temporal_window_size} frames - "
+                  f"temporal receptive field limited to {args.temporal_window_size} frames",
+                  category="setup", force=True)
+    else:
+        set_temporal_cap_7b(0)
+        set_temporal_cap_3b(0)
+
     # Use fixed IDs for CLI caching when enabled
     dit_id = "cli_dit" if cache_dit else None
     vae_id = "cli_vae" if cache_vae else None
-    
+
     runner, cache_context = prepare_runner(
         dit_model=args.dit_model,
         vae_model=DEFAULT_VAE,
@@ -963,6 +1016,88 @@ def _process_frames_core(
     )
     log_generation_start(gen_info, debug)
     
+    # Motion analysis for scene-cut and fast-motion detection
+    if args.temporal_overlap > 0 or args.prepend_frames > 0:
+        if args.motion_compensation == "auto" or args.motion_compensation == "enabled":
+            from src.core.motion_analysis import compute_motion_analysis
+            debug.log("Computing motion analysis for temporal blending...", category="motion")
+            motion_boundaries = compute_motion_analysis(
+                frames_tensor, sensitivity=args.motion_sensitivity, downscale=96, return_flow=False
+            )
+            ctx['motion_boundaries'] = motion_boundaries
+            ctx['input_frames'] = frames_tensor
+            
+            scene_cuts = [i+1 for i, b in enumerate(motion_boundaries) if b.type.value == "scene_cut"]
+            motions = [i+1 for i, b in enumerate(motion_boundaries) if b.type.value == "motion"]
+            debug.log(f"Motion analysis: {len(motion_boundaries)} boundaries (sensitivity={args.motion_sensitivity})", category="motion")
+            if scene_cuts:
+                debug.log(f"  Scene cuts at frames: {scene_cuts}", category="motion", indent_level=1)
+            if motions:
+                debug.log(f"  Motion boundaries: {motions}", category="motion", indent_level=1)
+            if not scene_cuts and not motions:
+                debug.log("  All frames static (minimal motion)", category="motion", indent_level=1)
+                # Show per-boundary details for diagnosis
+                for i, b in enumerate(motion_boundaries):
+                    debug.log(f"    Boundary {i}->{i+1}: mag={b.magnitude:.3f}px, consistency={b.consistency:.3f}, type={b.type.value}",
+                             category="motion", indent_level=2)
+        elif args.motion_compensation == "disabled":
+            debug.log("Motion compensation disabled by user", category="motion")
+    
+    # Compute motion-adaptive batches if enabled
+    batch_ranges = None
+    if args.motion_adaptive_batching:
+        from src.core.motion_analysis import compute_motion_analysis as _compute_motion_for_adaptive
+        from src.core.motion_analysis import compute_motion_adaptive_batches, MotionType
+        
+        debug.log("Computing motion analysis for adaptive batching...", category="motion", force=True)
+        adaptive_motion_boundaries = _compute_motion_for_adaptive(
+            frames_tensor, sensitivity=args.motion_sensitivity, downscale=96, return_flow=False
+        )
+        
+        # Log motion analysis summary for diagnosis
+        sc_count = sum(1 for b in adaptive_motion_boundaries if b.type == MotionType.SCENE_CUT)
+        mo_count = sum(1 for b in adaptive_motion_boundaries if b.type == MotionType.MOTION)
+        st_count = sum(1 for b in adaptive_motion_boundaries if b.type == MotionType.STATIC)
+        mags = [b.magnitude for b in adaptive_motion_boundaries]
+        if mags:
+            sorted_mags = sorted(mags)
+            n = len(sorted_mags)
+            median_mag = sorted_mags[n // 2]
+            avg_m = sum(mags) / n
+            variance = sum((m - avg_m) ** 2 for m in mags) / n
+            std_m = variance ** 0.5
+            spike_ratio = max(1.2, 5.0 - args.motion_threshold * 6.0)
+            debug.log(f"Motion analysis: {len(adaptive_motion_boundaries)} boundaries "
+                      f"(sensitivity={args.motion_sensitivity})",
+                      category="motion", force=True)
+            debug.log(f"  Classifications: {sc_count} scene_cuts, {mo_count} motion, {st_count} static",
+                      category="motion", indent_level=1)
+            debug.log(f"  Magnitude: min={min(mags):.2f}px, max={max(mags):.2f}px, "
+                      f"avg={avg_m:.2f}px, median={median_mag:.2f}px, std={std_m:.2f}px",
+                      category="motion", indent_level=1)
+            debug.log(f"  Scene cut detection: local spike ratio > {spike_ratio:.1f}x "
+                      f"(window ±{5} frames)",
+                      category="motion", indent_level=1)
+        else:
+            debug.log(f"Motion analysis: {len(adaptive_motion_boundaries)} boundaries "
+                      f"(sensitivity={args.motion_sensitivity}) - no motion data",
+                      category="motion", force=True)
+        
+        batch_ranges = compute_motion_adaptive_batches(
+            adaptive_motion_boundaries,
+            total_frames=len(frames_tensor),
+            min_batch_size=args.min_batch_size,
+            max_batch_size=args.max_batch_size,
+            motion_threshold=args.motion_threshold,
+        )
+        
+        # Log batch distribution
+        batch_sizes = [end - start for start, end in batch_ranges]
+        debug.log(f"Motion-adaptive batching: {len(batch_ranges)} variable-sized batches", category="motion", force=True)
+        debug.log(f"Batch sizes: {batch_sizes} (min={min(batch_sizes)}, max={max(batch_sizes)}, "
+                  f"avg={sum(batch_sizes)/len(batch_sizes):.1f}, total={sum(batch_sizes)}",
+                  category="motion", force=True)
+    
     # Phase 1: Encode
     ctx = encode_all_batches(
         runner, ctx=ctx, images=frames_tensor,
@@ -975,7 +1110,8 @@ def _process_frames_core(
         resolution=args.resolution,
         max_resolution=args.max_resolution,
         input_noise_scale=args.input_noise_scale,
-        color_correction=args.color_correction
+        color_correction=args.color_correction,
+        batch_ranges=batch_ranges,
     )
     
     # Phase 2: Upscale
@@ -1104,6 +1240,288 @@ def _worker_process(
     done_barrier.wait()
 
 
+def _process_frames_core_with_pipeline(
+    frames_tensor: torch.Tensor,
+    args: argparse.Namespace,
+    device_list: List[str],
+    debug: Debug,
+) -> torch.Tensor:
+    """
+    Pipeline-parallel frame processing that splits DiT blocks across GPUs.
+
+    VAE encoding runs on GPU 0, DiT blocks are split across all GPUs,
+    VAE decoding runs on the last GPU. Single process, no torch.distributed.
+
+    Args:
+        frames_tensor: Input frames [T, H, W, C], Float16, range [0,1]
+        args: Command-line arguments with all processing settings
+        device_list: List of GPU device IDs (e.g., ["0", "1"])
+        debug: Debug instance for logging
+
+    Returns:
+        Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
+    """
+    from src.core.generation_utils import setup_generation_context
+    from src.core.model_configuration import configure_runner
+    from src.core.model_loader import materialize_model
+    from src.core.generation_phases import (
+        encode_all_batches, upscale_all_batches, decode_all_batches, postprocess_all_batches
+    )
+    from src.core.generation_utils import (
+        compute_generation_info, log_generation_start, load_text_embeddings, script_directory
+    )
+    from src.utils.constants import SEEDVR2_FOLDER_NAME
+
+    num_gpus = len(device_list)
+    vae_device = f"cuda:{device_list[0]}"  # VAE encode on GPU 0
+    dit_device = f"cuda:{device_list[-1]}"  # DiT output on last GPU
+
+    # Reduce batch size in pipeline mode to save VAE encoding memory
+    pipeline_batch_size = max(1, args.batch_size // num_gpus)
+
+    debug.log(f"Pipeline mode: VAE on GPU {device_list[0]}, DiT split across {num_gpus} GPUs",
+              category="pipeline", force=True)
+    debug.log(f"Pipeline mode: Reduced batch size to {pipeline_batch_size} for VAE encoding",
+              category="pipeline", force=True)
+    if args.blocks_to_swap > 0:
+        debug.log(f"Pipeline mode: BlockSwap enabled - swapping {args.blocks_to_swap} blocks to CPU",
+                  category="pipeline", force=True)
+    debug.log(f"Pipeline mode: VAE tiling forced on (encode/decode) for memory efficiency",
+              category="pipeline", force=True)
+
+    # Setup generation context
+    # When BlockSwap is enabled, dit_offload_device must be set (validator requires it)
+    ctx = setup_generation_context(
+        dit_device=dit_device,
+        vae_device=vae_device,
+        dit_offload_device="cpu" if args.blocks_to_swap > 0 else None,
+        vae_offload_device=None,
+        tensor_offload_device="cpu",
+        debug=debug
+    )
+
+    # Apply temporal window settings
+    from src.models.dit_7b.window import set_temporal_window_isolation as set_temporal_isolation_7b
+    from src.models.dit_3b.window import set_temporal_window_isolation as set_temporal_isolation_3b
+    from src.models.dit_7b.window import set_temporal_window_size_cap as set_temporal_cap_7b
+    from src.models.dit_3b.window import set_temporal_window_size_cap as set_temporal_cap_3b
+
+    if args.temporal_window_isolation:
+        set_temporal_isolation_7b(True)
+        set_temporal_isolation_3b(True)
+    else:
+        set_temporal_isolation_7b(False)
+        set_temporal_isolation_3b(False)
+
+    if args.temporal_window_size > 0:
+        set_temporal_cap_7b(args.temporal_window_size)
+        set_temporal_cap_3b(args.temporal_window_size)
+    else:
+        set_temporal_cap_7b(0)
+        set_temporal_cap_3b(0)
+
+    # Prepare runner
+    model_dir = args.model_dir if args.model_dir is not None else f"./models/{SEEDVR2_FOLDER_NAME}"
+
+    runner, cache_context = configure_runner(
+        dit_model=args.dit_model,
+        vae_model=DEFAULT_VAE,
+        base_cache_dir=model_dir,
+        debug=debug,
+        ctx=ctx,
+        dit_cache=False,
+        vae_cache=False,
+        dit_id=None,
+        vae_id=None,
+        block_swap_config={
+            'blocks_to_swap': args.blocks_to_swap,
+            'swap_io_components': args.swap_io_components,
+            'offload_device': "cpu",
+        } if args.blocks_to_swap > 0 else None,
+        encode_tiled=True,  # Force VAE tiling in pipeline mode
+        encode_tile_size=(args.vae_encode_tile_size, args.vae_encode_tile_size),
+        encode_tile_overlap=(args.vae_encode_tile_overlap, args.vae_encode_tile_overlap),
+        decode_tiled=True,  # Force VAE tiling in pipeline mode
+        decode_tile_size=(args.vae_decode_tile_size, args.vae_decode_tile_size),
+        decode_tile_overlap=(args.vae_decode_tile_overlap, args.vae_decode_tile_overlap),
+        tile_debug=args.tile_debug.lower() if args.tile_debug else "false",
+        attention_mode=args.attention_mode,
+        torch_compile_args_dit=None,
+        torch_compile_args_vae=None
+    )
+
+    ctx['cache_context'] = cache_context
+
+    # Load text embeddings
+    ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
+
+    # Compute generation info
+    frames_tensor, gen_info = compute_generation_info(
+        ctx=ctx,
+        images=frames_tensor,
+        resolution=args.resolution,
+        max_resolution=args.max_resolution,
+        batch_size=pipeline_batch_size,
+        uniform_batch_size=args.uniform_batch_size,
+        seed=args.seed,
+        prepend_frames=args.prepend_frames,
+        temporal_overlap=args.temporal_overlap,
+        debug=debug
+    )
+
+    log_generation_start(gen_info, debug)
+
+    # Compute motion-adaptive batches if enabled
+    batch_ranges = None
+    if args.motion_adaptive_batching:
+        from src.core.motion_analysis import compute_motion_analysis as _compute_motion_for_adaptive
+        from src.core.motion_analysis import compute_motion_adaptive_batches, MotionType
+
+        debug.log("Computing motion analysis for adaptive batching...", category="motion", force=True)
+        adaptive_motion_boundaries = _compute_motion_for_adaptive(
+            frames_tensor, sensitivity=args.motion_sensitivity, downscale=96, return_flow=False
+        )
+
+        sc_count = sum(1 for b in adaptive_motion_boundaries if b.type == MotionType.SCENE_CUT)
+        mo_count = sum(1 for b in adaptive_motion_boundaries if b.type == MotionType.MOTION)
+        st_count = sum(1 for b in adaptive_motion_boundaries if b.type == MotionType.STATIC)
+        mags = [b.magnitude for b in adaptive_motion_boundaries]
+        if mags:
+            sorted_mags = sorted(mags)
+            n = len(sorted_mags)
+            median_mag = sorted_mags[n // 2]
+            avg_m = sum(mags) / n
+            variance = sum((m - avg_m) ** 2 for m in mags) / n
+            std_m = variance ** 0.5
+            debug.log(f"Motion analysis: {len(adaptive_motion_boundaries)} boundaries "
+                      f"(sensitivity={args.motion_sensitivity})",
+                      category="motion", force=True)
+            debug.log(f"  Classifications: {sc_count} scene_cuts, {mo_count} motion, {st_count} static",
+                      category="motion", indent_level=1)
+            debug.log(f"  Magnitude: min={min(mags):.2f}px, max={max(mags):.2f}px, "
+                      f"avg={avg_m:.2f}px, median={median_mag:.2f}px, std={std_m:.2f}px",
+                      category="motion", indent_level=1)
+
+        batch_ranges = compute_motion_adaptive_batches(
+            adaptive_motion_boundaries,
+            total_frames=len(frames_tensor),
+            min_batch_size=args.min_batch_size,
+            max_batch_size=args.max_batch_size,
+            motion_threshold=args.motion_threshold,
+        )
+
+        batch_sizes = [end - start for start, end in batch_ranges]
+        debug.log(f"Motion-adaptive batching: {len(batch_ranges)} variable-sized batches",
+                  category="motion", force=True)
+        debug.log(f"Batch sizes: {batch_sizes} (min={min(batch_sizes)}, max={max(batch_sizes)}, "
+                  f"avg={sum(batch_sizes)/len(batch_sizes):.1f}, total={sum(batch_sizes)}",
+                  category="motion", force=True)
+
+    # === Phase 1: VAE Encode on GPU 0 ===
+    materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
+
+    ctx = encode_all_batches(
+        runner, ctx=ctx, images=frames_tensor,
+        debug=debug,
+        batch_size=pipeline_batch_size,
+        uniform_batch_size=args.uniform_batch_size,
+        seed=args.seed,
+        progress_callback=None,
+        temporal_overlap=args.temporal_overlap,
+        resolution=args.resolution,
+        max_resolution=args.max_resolution,
+        input_noise_scale=args.input_noise_scale,
+        color_correction=args.color_correction,
+        batch_ranges=batch_ranges,
+    )
+
+    # Move VAE to CPU before DiT (can't delete - materialize_model can't re-load)
+    runner.vae = runner.vae.to("cpu")
+    torch.cuda.empty_cache()
+    debug.log("VAE moved to CPU, clearing cache before DiT", category="pipeline", force=True)
+
+    # === Phase 2: DiT Upscale with pipeline parallelism ===
+    materialize_model(runner, "dit", ctx['dit_device'], runner.config, debug)
+
+    # Wrap DiT with pipeline parallel wrapper
+    # This intercepts self.dit(...) calls in runner.inference()
+    from src.core.fsdp_wrapper import PipelineDiTWrapper
+    device_list_torch = [torch.device(f"cuda:{d}") for d in device_list]
+    runner.dit = PipelineDiTWrapper(
+        runner.dit, device_list_torch, debug=debug,
+        spatial_tile_size=args.spatial_tile_size,
+        spatial_tile_overlap=args.spatial_tile_overlap,
+    )
+    debug.log(f"DiT wrapped with PipelineDiTWrapper across {len(device_list_torch)} GPUs",
+              category="pipeline", force=True)
+
+    ctx = upscale_all_batches(
+        runner, ctx=ctx, debug=debug, progress_callback=None,
+        seed=args.seed,
+        latent_noise_scale=args.latent_noise_scale,
+        cache_model=False
+    )
+
+    # DiT already cleaned up by upscale_all_batches (moved to CPU, runner.dit = None)
+    torch.cuda.empty_cache()
+    debug.log("DiT cleaned up by upscale_all_batches, clearing cache before VAE decode", category="pipeline", force=True)
+
+    # === Phase 3: VAE Decode (move VAE back to GPU) ===
+    runner.vae = runner.vae.to(ctx['vae_device'])
+
+    ctx = decode_all_batches(
+        runner, ctx=ctx, debug=debug, progress_callback=None,
+        cache_model=False,
+    )
+
+    # === Phase 4: Post-process ===
+    # Aggressively clean up all GPU memory before post-processing to avoid OOM.
+    # Phase 3 leaves VAE + residual allocations from pipeline parallelism (~20GB),
+    # and Phase 4 needs GPU for color correction on large batches.
+    import gc as _gc
+    for d in device_list:
+        torch.cuda.synchronize(f"cuda:{d}")
+    _gc.collect()
+    _gc.collect()
+    torch.cuda.empty_cache()
+    # Log memory state after cleanup to diagnose lingering allocations
+    for d in device_list:
+        alloc = torch.cuda.memory_allocated(f"cuda:{d}") / (1024**3)
+        reserved = torch.cuda.memory_reserved(f"cuda:{d}") / (1024**3)
+        debug.log(f"  GPU {d} after cleanup: {alloc:.1f}GB allocated, {reserved:.1f}GB reserved",
+                  category="pipeline", force=True)
+    # If still too much memory, try to defragment (PyTorch 2.4+)
+    if torch.cuda.memory_allocated(f"cuda:{device_list[0]}") / (1024**3) > 10:
+        debug.log("  High memory detected, attempting defragmentation...", category="pipeline", force=True)
+        if hasattr(torch.cuda, 'memory_defragment'):
+            torch.cuda.memory_defragment(f"cuda:{device_list[0]}")
+            debug.log("  Defragmentation complete", category="pipeline", force=True)
+        else:
+            debug.log("  Defragmentation not available (PyTorch < 2.4), color correction may use CPU fallback",
+                      category="pipeline", force=True)
+
+    ctx = postprocess_all_batches(
+        ctx=ctx, debug=debug, progress_callback=None,
+        color_correction=args.color_correction,
+        prepend_frames=args.prepend_frames,
+        temporal_overlap=args.temporal_overlap,
+        batch_size=args.batch_size
+    )
+
+    result_tensor = ctx['final_video']
+
+    # Convert to CPU and compatible dtype
+    if result_tensor.is_cuda or result_tensor.is_mps:
+        result_tensor = result_tensor.cpu()
+    if result_tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
+        result_tensor = result_tensor.to(torch.float32)
+
+    return result_tensor
+
+
+
+
+
 def _single_gpu_direct_processing(
     frames_tensor: torch.Tensor,
     args: argparse.Namespace,
@@ -1124,19 +1542,72 @@ def _single_gpu_direct_processing(
     )
 
 
+def _gpu_processing_fsdp(
+    frames_tensor: torch.Tensor,
+    device_list: List[str],
+    args: argparse.Namespace,
+) -> torch.Tensor:
+    """
+    Pipeline parallel multi-GPU processing: split model blocks across GPUs.
+
+    Uses single-process pipeline parallelism — DiT blocks are split across GPUs,
+    activations stream between them via .to(device) transfers. No torch.distributed
+    needed (works on Windows without NCCL/gloo).
+
+    Args:
+        frames_tensor: Input frames [T, H, W, C] (required, no streaming in FSDP mode)
+        device_list: List of GPU device IDs (e.g., ["0", "1"])
+        args: Parsed command-line arguments
+
+    Returns:
+        Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
+    """
+    world_size = len(device_list)
+    debug.log(f"Pipeline mode: {world_size} GPUs will share model blocks for VRAM pooling",
+              category="fsdp", force=True)
+    debug.log(f"Pipeline mode: All GPUs process same {frames_tensor.shape[0]} frames together",
+              category="fsdp", force=True)
+    debug.log(f"Pipeline mode: GPUs {device_list} - blocks split evenly across GPUs",
+              category="fsdp", force=True)
+
+    # Set CUDA_VISIBLE_DEVICES so pipeline sees the right GPUs
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(device_list)
+
+    # Process frames with pipeline-parallel models (single process)
+    result_tensor = _process_frames_core_with_pipeline(
+        frames_tensor=frames_tensor,
+        args=args,
+        device_list=[str(i) for i in range(world_size)],  # Re-mapped device IDs
+        debug=debug,
+    )
+
+    # Handle prepend_frames removal
+    if args.prepend_frames > 0:
+        if args.prepend_frames < result_tensor.shape[0]:
+            debug.log(f"Removing {args.prepend_frames} prepended frames from output", category="generation")
+            result_tensor = result_tensor[args.prepend_frames:]
+        else:
+            debug.log(f"prepend_frames ({args.prepend_frames}) >= total frames ({result_tensor.shape[0]}), skipping removal",
+                     level="WARNING", category="generation", force=True)
+
+    return result_tensor
+
+
 def _gpu_processing(
     frames_tensor: Optional[torch.Tensor],
     device_list: List[str], 
     args: argparse.Namespace,
-    video_info: Optional[Dict[str, Any]] = None
+    video_info: Optional[Dict[str, Any]] = None,
+    fsdp_mode: bool = False
 ) -> torch.Tensor:
     """
     Orchestrate multi-GPU parallel video upscaling with temporal overlap blending.
     
-    Supports two modes:
-    1. video_info provided: Workers stream their assigned video segments internally
+    Supports three modes:
+    1. FSDP mode (fsdp_mode=True): Model sharded across GPUs, all GPUs process same frames
+    2. video_info provided: Workers stream their assigned video segments internally
        (each GPU reads and processes its frame range with internal chunking)
-    2. frames_tensor provided: Workers process pre-loaded frame chunks
+    3. frames_tensor provided: Workers process pre-loaded frame chunks
        (non streaming behavior for images or pre-loaded videos)
     
     Args:
@@ -1145,12 +1616,17 @@ def _gpu_processing(
         args: Parsed command-line arguments containing all processing settings
         video_info: Optional dict with 'video_path', 'start_frame', 'frames_to_process'
                    for streaming mode where workers read video directly
+        fsdp_mode: If True, use FSDP for VRAM pooling instead of frame distribution
     
     Returns:
         Upscaled frames tensor [T', H', W', C], Float32, range [0,1]
     """
     num_devices = len(device_list)
     overlap = args.temporal_overlap
+    
+    # FSDP mode: all GPUs process same frames with sharded models
+    if fsdp_mode:
+        return _gpu_processing_fsdp(frames_tensor, device_list, args)
     
     return_queue = mp.Queue(maxsize=0)
     done_barrier = mp.Barrier(num_devices + 1)
@@ -1255,9 +1731,14 @@ def _gpu_processing(
                     # Get overlapping regions
                     prev_tail = result_tensor[-overlap:]  # Last N frames from accumulated result
                     cur_head = chunk_tensor[:overlap]      # First N frames from current chunk
-                    
-                    # Blend using shared function
-                    blended = blend_overlapping_frames(prev_tail, cur_head, overlap)
+
+                    # Inter-GPU blend: use cur_head only to avoid ghosting
+                    # Motion data is not available in parent process (workers are separate processes)
+                    # Even a small blend of prev_tail causes visible ghosting on fast motion
+                    blended = cur_head
+                    debug.log(f"Inter-GPU blend at frame {len(result_tensor) - overlap}: "
+                              f"using cur_head only (no blend to avoid ghosting)",
+                              category="motion", indent_level=1)
                     
                     # Replace tail of result with blended frames, then append rest of chunk
                     result_tensor = torch.cat([
@@ -1391,6 +1872,57 @@ Examples:
                         help="Prepend N reversed frames to reduce start artifacts (auto-removed). Default: 0")
     process_group.add_argument("--temporal_overlap", type=int, default=0,
                         help="Frames to overlap between batches/GPUs for smooth blending (default: 0)")
+    process_group.add_argument("--motion_compensation", type=str, default="auto",
+                        choices=["auto", "enabled", "disabled"],
+                        help="Motion-aware temporal blending for scene cuts and fast camera movement. "
+                             "'auto' enables when temporal_overlap > 0, 'enabled' always on, 'disabled' never. "
+                             "Prevents ghosting artifacts. Default: auto")
+    process_group.add_argument("--motion_sensitivity", type=float, default=0.5,
+                        help="Motion detection sensitivity (0.0-1.0). Lower=conservative, higher=aggressive. "
+                             "Default: 0.5")
+    process_group.add_argument("--temporal_window_isolation", action="store_true",
+                        help="Disable temporal shifting in the DiT model's window attention. Prevents cross-window "
+                             "temporal propagation (ghosting) while preserving spatial quality. Effective temporal "
+                             "receptive field limited to ~4-8 frames instead of full batch. Recommended for fast "
+                             "camera motion or when using large batch_size with the 7B model.")
+    process_group.add_argument("--temporal_window_size", type=int, default=0,
+                        help="Maximum number of frames per temporal attention window (0=auto, 1-16). "
+                             "Directly controls the temporal receptive field of the model. Lower values reduce "
+                             "ghosting on fast motion/scene cuts but also reduce temporal consistency on static "
+                             "regions. Recommended: 1-4 for fast motion, 5-8 for moderate motion, 0 for maximum "
+                             "temporal consistency (model default). Works with or without --temporal_window_isolation.")
+    process_group.add_argument("--motion_adaptive_batching", action="store_true",
+                        help="Use motion-adaptive variable batch sizes to prevent VAE temporal ghosting while "
+                             "maintaining temporal consistency. Analyzes motion intensity per frame and creates "
+                             "smaller batches (min_batch_size) for fast motion/scene cuts, larger batches "
+                             "(max_batch_size) for static content. The VAE has a temporal receptive field of "
+                             "~30-40 frames, so large batches cause ghosting on fast motion. This feature "
+                             "dynamically adjusts batch size to match content motion. Overrides --batch_size "
+                             "and --temporal_overlap for the encoding phase.")
+    process_group.add_argument("--min_batch_size", type=int, default=5,
+                        help="Minimum frames per batch for motion-adaptive batching (default: 5). "
+                             "Used for fast motion/scene cut regions. Must follow 4n+1 constraint. "
+                             "Only used with --motion_adaptive_batching.")
+    process_group.add_argument("--max_batch_size", type=int, default=49,
+                        help="Maximum frames per batch for motion-adaptive batching (default: 49). "
+                             "Used for static content regions. Must follow 4n+1 constraint. "
+                             "Only used with --motion_adaptive_batching.")
+    process_group.add_argument("--motion_threshold", type=float, default=0.3,
+                        help="Motion intensity threshold for adaptive batching (0.0-1.0, default: 0.3). "
+                             "Boundaries with normalized motion above this threshold force a new batch. "
+                             "Lower=more conservative (fewer splits), higher=more aggressive (more splits). "
+                             "Only used with --motion_adaptive_batching.")
+    
+    # Multi-GPU Mode
+    multigpu_group = parser.add_argument_group('Multi-GPU mode')
+    multigpu_group.add_argument("--fsdp", action="store_true",
+                        help="Use FSDP (Fully Sharded Data Parallel) for multi-GPU processing. "
+                             "Combines VRAM across all GPUs by sharding model weights, enabling larger "
+                             "resolutions and batch sizes that wouldn't fit on a single GPU. Requires "
+                             "--cuda_device with multiple GPUs (e.g., --cuda_device 0,1). In FSDP mode, "
+                             "all GPUs process the same frames together (synchronous), trading speed for "
+                             "VRAM capacity. Incompatible with --cache_dit/--cache_vae and streaming "
+                             "(--chunk_size).")
     
     # Quality Control
     quality_group = parser.add_argument_group('Quality control')
@@ -1442,6 +1974,21 @@ Examples:
                         help="VAE decode tile overlap in pixels (default: 128). Reduces visible seams between tiles. Only used if --vae_decode_tiled is set")
     vae_group.add_argument("--tile_debug", type=str, default="false", choices=["false", "encode", "decode"],
                         help="Visualize tiles: 'false' (default), 'encode', or 'decode'")
+    
+    # DiT Spatial Tiling
+    dit_tile_group = parser.add_argument_group('DiT spatial tiling (for VRAM reduction)')
+    dit_tile_group.add_argument("--spatial_tile_size", type=int, default=0,
+                        help="DiT spatial tile size in latent pixels (0=disabled, recommended: 64-128). "
+                             "Splits the video into overlapping spatial tiles for DiT processing, "
+                             "dramatically reducing peak VRAM usage. Each tile is processed independently "
+                             "through the full DiT forward pass, then stitched with overlap blending. "
+                             "Quality is preserved in central tile regions. "
+                             "Use with --fsdp for maximum VRAM savings. Default: 0 (disabled)")
+    dit_tile_group.add_argument("--spatial_tile_overlap", type=int, default=32,
+                        help="DiT spatial tile overlap in latent pixels (default: 32). "
+                             "Overlap region is blended between adjacent tiles to prevent visible seams. "
+                             "Larger overlap = smoother blending but more compute. "
+                             "Only used if --spatial_tile_size is set. Default: 32")
     
     # Performance
     perf_group = parser.add_argument_group('Performance optimization')
@@ -1538,6 +2085,42 @@ def main() -> None:
                  level="ERROR", category="setup", force=True)
         sys.exit(1)
     
+    # Validate FSDP configuration
+    if hasattr(args, 'fsdp') and args.fsdp:
+        from src.core.fsdp_wrapper import is_fsdp_available
+        if not is_fsdp_available():
+            debug.log("FSDP is not available in your PyTorch installation. "
+                     "Ensure PyTorch >= 2.0 with distributed support.",
+                     level="ERROR", category="setup", force=True)
+            sys.exit(1)
+        
+        # FSDP requires multiple GPUs
+        if platform.system() != "Darwin":
+            if not args.cuda_device:
+                debug.log("--fsdp requires --cuda_device with multiple GPUs (e.g., --cuda_device 0,1)",
+                         level="ERROR", category="setup", force=True)
+                sys.exit(1)
+            device_list_preview = [d.strip() for d in str(args.cuda_device).split(',') if d.strip()]
+            if len(device_list_preview) < 2:
+                debug.log("--fsdp requires at least 2 GPUs (e.g., --cuda_device 0,1)",
+                         level="ERROR", category="setup", force=True)
+                sys.exit(1)
+        else:
+            debug.log("--fsdp is not supported on macOS (MPS backend)",
+                     level="ERROR", category="setup", force=True)
+            sys.exit(1)
+        
+        # FSDP is incompatible with certain features
+        if args.cache_dit or args.cache_vae:
+            debug.log("--fsdp is incompatible with --cache_dit/--cache_vae (model sharding prevents caching)",
+                     level="ERROR", category="setup", force=True)
+            sys.exit(1)
+        
+        if args.chunk_size > 0:
+            debug.log("--fsdp is incompatible with --chunk_size (streaming mode requires full frame load)",
+                     level="ERROR", category="setup", force=True)
+            sys.exit(1)
+    
     # Inform about caching defaults
     if args.cache_dit and args.dit_offload_device == "none":
         offload_target = "system memory (CPU)" if get_gpu_backend() != "mps" else "unified memory"
@@ -1578,6 +2161,16 @@ def main() -> None:
                 device_list = ["0"]
         if args.debug:
             debug.log(f"Using devices: {device_list}", category="device")
+        
+        # Log FSDP mode if enabled
+        fsdp_mode = hasattr(args, 'fsdp') and args.fsdp
+        if fsdp_mode:
+            debug.log(f"FSDP mode ENABLED: {len(device_list)} GPUs will shard model weights for VRAM pooling",
+                     category="fsdp", force=True)
+            debug.log(f"FSDP mode: Each GPU holds ~{100//len(device_list)}% of model weights",
+                     category="fsdp", force=True)
+            debug.log(f"FSDP mode: All GPUs process same frames synchronously",
+                     category="fsdp", force=True)
         
         # Download models once before processing
         if not download_weight(dit_model=args.dit_model, vae_model=DEFAULT_VAE, model_dir=args.model_dir, debug=debug):

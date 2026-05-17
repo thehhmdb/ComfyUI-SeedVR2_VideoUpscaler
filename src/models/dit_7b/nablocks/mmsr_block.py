@@ -127,11 +127,26 @@ class NaSwinAttention(MMWindowAttention):
         if self.rope:
             vid_q, vid_k = self.rope(vid_q, vid_k, window_shape, cache_win)
 
+        # --- VRAM optimization: free Q/K/V sources between concat calls ---
+        # Each concat_win creates a ~2 GB intermediate. Computing them sequentially
+        # with del + empty_cache between calls prevents 3x accumulation.
+        q_concat = concat_win(vid_q, txt_q)
+        del vid_q, txt_q
+        torch.cuda.empty_cache()
+
+        k_concat = concat_win(vid_k, txt_k)
+        del vid_k, txt_k
+        torch.cuda.empty_cache()
+
+        v_concat = concat_win(vid_v, txt_v)
+        del vid_v, txt_v
+        torch.cuda.empty_cache()
+
         # Attention handles dtype conversion internally using pipeline compute_dtype
         out = self.attn(
-            q=concat_win(vid_q, txt_q),
-            k=concat_win(vid_k, txt_k),
-            v=concat_win(vid_v, txt_v),
+            q=q_concat,
+            k=k_concat,
+            v=v_concat,
             cu_seqlens_q=cache_win(
                 "vid_seqlens_q", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
             ),
@@ -140,7 +155,9 @@ class NaSwinAttention(MMWindowAttention):
             ),
             max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max()),
             max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max()),
-        ).type_as(vid_q)
+        )
+        del q_concat, k_concat, v_concat
+        out = out.type_as(out)  # dtype preserved from attention output
 
         # text pooling
         vid_out, txt_out = unconcat_win(out)

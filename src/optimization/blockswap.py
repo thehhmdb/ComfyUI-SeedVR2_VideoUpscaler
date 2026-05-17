@@ -197,11 +197,11 @@ def apply_block_swap_to_dit(
     
     debug.start_timer("apply_blockswap")
 
-    # Get the actual model (handle CompatibleDiT wrapper)
+    # Get the actual model - unwrap ALL wrapper layers (PipelineDiTWrapper > CompatibleDiT > NaDiT)
     model = runner.dit
-    if hasattr(model, "dit_model"):
+    while hasattr(model, "dit_model"):
         model = model.dit_model
-    
+
     # Determine devices
     if hasattr(runner, '_dit_device'):
         device = runner._dit_device
@@ -794,12 +794,12 @@ def set_blockswap_bypass(runner, bypass: bool, debug):
     """
     if not hasattr(runner, "_blockswap_active") or not runner._blockswap_active:
         return
-    
-    # Get the actual model (handle CompatibleDiT wrapper)
+
+    # Get the actual model - unwrap ALL wrapper layers (PipelineDiTWrapper > CompatibleDiT > NaDiT)
     model = runner.dit
-    if hasattr(model, "dit_model"):
+    while hasattr(model, "dit_model"):
         model = model.dit_model
-    
+
     # Store on model so it survives runner recreation during caching
     model._blockswap_bypass_protection = bypass
     
@@ -827,21 +827,21 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     # Get debug instance from runner
     if not hasattr(runner, 'debug') or runner.debug is None:
         raise ValueError("Debug instance must be available on runner for cleanup_blockswap")
-    
+
     debug = runner.debug
-    
-    # Get the actual model (handle CompatibleDiT wrapper)
+
+    # Get the actual model - unwrap ALL wrapper layers (PipelineDiTWrapper > CompatibleDiT > NaDiT)
     model = runner.dit
-    if hasattr(model, "dit_model"):
+    while hasattr(model, "dit_model"):
         model = model.dit_model
-    
+
     # Check if there's any BlockSwap state to clean up (check both runner and model)
     has_blockswap_state = (
-        hasattr(runner, "_blockswap_active") or 
+        hasattr(runner, "_blockswap_active") or
         hasattr(model, "_block_swap_config") or
         hasattr(model, "_blockswap_bypass_protection")
     )
-    
+
     if not has_blockswap_state:
         return
 
@@ -858,9 +858,9 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
         return
 
     # Full cleanup when not caching
-    # Get the actual model (handle CompatibleDiT wrapper)
+    # Get the actual model - unwrap ALL wrapper layers (PipelineDiTWrapper > CompatibleDiT > NaDiT)
     model = runner.dit
-    if hasattr(model, "dit_model"):
+    while hasattr(model, "dit_model"):
         model = model.dit_model
 
     # 1. Restore block forward methods

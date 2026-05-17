@@ -16,6 +16,62 @@ from math import ceil
 from typing import Tuple
 import math
 
+# Global flag to disable temporal shifting in shifted-window layers.
+# When True, shifted windows still shift spatially (H, W) but NOT temporally (T).
+# This prevents cross-window temporal propagation (ghosting) while preserving
+# spatial quality from the shifted-window method.
+# Set via: from src.models.dit_7b.window import set_temporal_window_isolation; set_temporal_window_isolation(True)
+_temporal_window_isolation = False
+
+# Global cap on temporal window size (in frames).
+# When > 0, limits the number of frames that attend to each other in each temporal window.
+# Smaller values reduce ghosting on fast motion/scene cuts but also reduce temporal
+# consistency on static regions. Default: 0 (no cap, model uses full temporal window).
+# Recommended: 1-4 for fast motion, 5-8 for moderate motion, 0 for maximum temporal consistency.
+_temporal_window_size_cap = 0
+
+
+def set_temporal_window_isolation(enabled: bool):
+    """Enable/disable temporal window isolation.
+
+    When enabled, shifted-window layers use st=0 (no temporal shift), which
+    prevents information from propagating across temporal windows through the
+    shifted-window mechanism. This eliminates long-range temporal mixing
+    (ghosting) at the cost of reduced temporal receptive field.
+
+    Args:
+        enabled: True to isolate temporal windows, False for normal behavior.
+    """
+    global _temporal_window_isolation
+    _temporal_window_isolation = enabled
+
+
+def get_temporal_window_isolation() -> bool:
+    """Get current temporal window isolation state."""
+    return _temporal_window_isolation
+
+
+def set_temporal_window_size_cap(cap: int):
+    """Set maximum temporal window size (in frames).
+
+    Limits how many frames can attend to each other within a single temporal window.
+    This directly controls the temporal receptive field of the model.
+
+    Args:
+        cap: Maximum frames per temporal window. 0 = no limit (model default).
+             Values 1-4: minimal ghosting, reduced temporal consistency.
+             Values 5-8: balanced ghosting prevention and temporal consistency.
+             Values 9+: more temporal consistency, potential ghosting on fast motion.
+    """
+    global _temporal_window_size_cap
+    _temporal_window_size_cap = max(0, cap)
+
+
+def get_temporal_window_size_cap() -> int:
+    """Get current temporal window size cap."""
+    return _temporal_window_size_cap
+
+
 def get_window_op(name: str):
     if name == "720pwin_by_size_bysize":
         return make_720Pwindows_bysize
@@ -33,6 +89,9 @@ def make_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, 
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
     wt = ceil(min(t, 30) / resized_nt)  # window size.
+    # Apply temporal window size cap to limit temporal receptive field
+    if _temporal_window_size_cap > 0:
+        wt = min(wt, _temporal_window_size_cap)
     nt, nh, nw = ceil(t / wt), ceil(h / wh), ceil(w / ww)  # window size.
     return [
         (
@@ -56,17 +115,19 @@ def make_shifted_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tup
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
     wt = ceil(min(t, 30) / resized_nt)  # window size.
-    
+
+    # Temporal shift: disabled when isolation is enabled to prevent cross-window
+    # temporal propagation (ghosting). Spatial shifts remain active for quality.
     st, sh, sw = (  # shift size.
-        0.5 if wt < t else 0,
+        0.0 if _temporal_window_isolation else (0.5 if wt < t else 0),
         0.5 if wh < h else 0,
         0.5 if ww < w else 0,
     )
     nt, nh, nw = ceil((t - st) / wt), ceil((h - sh) / wh), ceil((w - sw) / ww)  # window size.
     nt, nh, nw = (  # number of window.
-        nt + 1 if st > 0 else 1,
-        nh + 1 if sh > 0 else 1,
-        nw + 1 if sw > 0 else 1,
+        nt + 1 if st > 0 else ceil(t / wt),
+        nh + 1 if sh > 0 else ceil(h / wh),
+        nw + 1 if sw > 0 else ceil(w / ww),
     )
     return [
         (

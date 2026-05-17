@@ -34,6 +34,7 @@ from torchvision.transforms import Compose, Lambda, Normalize
 
 from .model_configuration import configure_runner
 from .infer import VideoDiffusionInfer
+from .motion_analysis import MotionBoundary
 from ..data.image.transforms.divisible_crop import DivisiblePad
 from ..data.image.transforms.na_resize import NaResize
 from ..optimization.compatibility import COMPUTE_DTYPE, BFLOAT16_SUPPORTED
@@ -310,6 +311,126 @@ def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, ov
     w_cur = 1.0 - w_prev
     
     return prev_tail * w_prev + cur_head * w_cur
+
+
+def motion_aware_blend(
+    prev_tail: torch.Tensor,
+    cur_head: torch.Tensor,
+    overlap: int,
+    motion_boundaries: Optional[List['MotionBoundary']] = None,
+    overlap_frame_idx: int = 0,
+    input_frames: Optional[torch.Tensor] = None,
+    debug: Optional['Debug'] = None,
+) -> Tuple[torch.Tensor, str]:
+    """
+    Per-pixel adaptive blending for overlapping frames.
+
+    For each overlap frame, computes a per-pixel similarity mask between
+    prev_tail[i] and cur_head[i], then uses this mask to weight the Hann
+    window blend per-pixel:
+    - Similar pixels (low difference) → mask ≈ 1 → full Hann blend → smooth transition
+    - Different pixels (high difference) → mask ≈ 0 → cur_head only → no ghosting
+
+    This handles partial-frame motion perfectly: static regions get smooth
+    blending (preserving temporal consistency), while changed regions use
+    the current frame only (no ghosting from stale content).
+
+    The similarity mask is computed as:
+        diff = |prev - cur|  (absolute difference, normalized to [0,1])
+        mask = exp(-diff / sigma)  where sigma controls sensitivity
+
+    The final blend weight per pixel is:
+        w_prev_pixel = hann_weight * similarity_mask
+        result = prev * w_prev_pixel + cur * (1 - w_prev_pixel)
+
+    Args:
+        prev_tail: Last `overlap` frames from previous batch [overlap, H, W, C]
+        cur_head: First `overlap` frames from current batch [overlap, H, W, C]
+        overlap: Number of overlapping frames
+        motion_boundaries: Motion analysis results from motion_analysis module
+        overlap_frame_idx: Frame index in the original video where overlap starts
+        input_frames: Original input frames [T, H, W, C] (unused, kept for API compat)
+        debug: Debug instance for logging
+
+    Returns:
+        Tuple of (blended frames [overlap, H, W, C], strategy used)
+    """
+    from .motion_analysis import MotionType
+
+    device = prev_tail.device
+    dtype = prev_tail.dtype
+
+    # Base Hann window weights (same as standard blending)
+    if overlap >= 3:
+        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=torch.float32)
+        blend_start = 1.0 / 3.0
+        blend_end = 2.0 / 3.0
+        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
+        w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)  # Hann window
+    else:
+        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=torch.float32)
+
+    # Check for scene cuts first (global fallback)
+    has_scene_cut = False
+    if motion_boundaries:
+        for j in range(overlap):
+            bi = overlap_frame_idx + j
+            if bi < len(motion_boundaries) and motion_boundaries[bi].type == MotionType.SCENE_CUT:
+                has_scene_cut = True
+                break
+
+    if has_scene_cut:
+        if debug:
+            debug.log(f"Scene cut at overlap {overlap_frame_idx}, using cur_head only",
+                      category="motion", indent_level=1)
+        return cur_head, "scene_cut_skip"
+
+    # Compute per-pixel similarity mask for each overlap frame pair
+    # Convert to float32 for precision in difference computation
+    prev_f = prev_tail.float()
+    cur_f = cur_head.float()
+
+    # Absolute difference per pixel: [overlap, H, W, C]
+    diff = torch.abs(prev_f - cur_f)  # [0, 1] range since inputs are [0, 1]
+
+    # Mean difference across color channels to get per-pixel similarity: [overlap, H, W]
+    diff_mean = diff.mean(dim=-1, keepdim=True)  # [overlap, H, W, 1]
+
+    # Similarity mask: exp(-diff / sigma) where sigma controls sensitivity
+    # sigma=0.05: diff=0→1.0, diff=0.05→0.37, diff=0.1→0.14, diff=0.2→0.02
+    # This means pixels that differ by >10% are essentially "different"
+    sigma = 0.05
+    similarity_mask = torch.exp(-diff_mean / sigma)  # [overlap, H, W, 1]
+
+    # Hann weights per frame: [overlap, 1, 1, 1]
+    w_prev_hann = w_prev_1d.view(overlap, 1, 1, 1)
+
+    # Per-pixel blend weight: Hann weight modulated by similarity
+    # Similar pixels → full Hann blend, different pixels → cur_head only
+    w_prev_pixel = w_prev_hann * similarity_mask  # [overlap, H, W, 1]
+    w_cur_pixel = 1.0 - w_prev_pixel
+
+    # Blend per-pixel
+    result = prev_f * w_prev_pixel + cur_f * w_cur_pixel
+
+    # Compute stats for logging
+    similarity_stats = similarity_mask.mean(dim=[1, 2], keepdim=False).cpu().tolist()
+    avg_similarity = sum(similarity_stats) / len(similarity_stats) if similarity_stats else 1.0
+
+    # Determine strategy label based on average similarity
+    if avg_similarity > 0.9:
+        strategy = "per_pixel_static"
+    elif avg_similarity > 0.5:
+        strategy = "per_pixel_partial_motion"
+    else:
+        strategy = "per_pixel_high_motion"
+
+    if debug:
+        debug.log(f"Per-pixel blend at overlap {overlap_frame_idx} "
+                  f"(avg_similarity={avg_similarity:.3f}, strategy={strategy})",
+                  category="motion", indent_level=1)
+
+    return result.to(dtype=dtype), strategy
 
 
 def setup_generation_context(

@@ -35,6 +35,7 @@ from .generation_utils import (
     _draw_tile_boundaries,
     load_text_embeddings,
     blend_overlapping_frames,
+    motion_aware_blend,
     calculate_optimal_batch_params,
     script_directory
 )
@@ -181,7 +182,8 @@ def encode_all_batches(
     resolution: int = 1080,
     max_resolution: int = 0,
     input_noise_scale: float = 0.0,
-    color_correction: str = "wavelet"
+    color_correction: str = "wavelet",
+    batch_ranges: Optional[List[Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """
     Phase 1: VAE Encoding for all batches
@@ -205,6 +207,9 @@ def encode_all_batches(
                           before VAE encoding to reduce artifacts at high resolutions.
         color_correction: Color correction method - "wavelet", "adain", or "none" (default: "wavelet")
                          Determines if transformed videos need to be stored for later use.
+        batch_ranges: Optional list of (start, end) tuples for motion-adaptive batching.
+                     When provided, overrides batch_size and temporal_overlap with
+                     variable-sized batches computed from motion analysis.
         
     Returns:
         dict: Context containing:
@@ -268,22 +273,36 @@ def encode_all_batches(
             debug.log("", category="none", force=True)
     
     # Calculate batching parameters
-    step = batch_size - temporal_overlap if temporal_overlap > 0 else batch_size
-    if step <= 0:
-        step = batch_size
-        temporal_overlap = 0
-        debug.log(f"temporal_overlap >= batch_size, resetting to 0", level="WARNING", category="setup", force=True)
+    if batch_ranges is not None:
+        # Motion-adaptive batching - use pre-computed variable-sized batches
+        batch_iterator = list(batch_ranges)
+        temporal_overlap = 0  # No overlap with adaptive batching (batches are independent)
+        debug.log(f"Motion-adaptive batching: {len(batch_iterator)} variable-sized batches", 
+                  category="setup", force=True)
+        batch_sizes = [end - start for start, end in batch_iterator]
+        debug.log(f"Batch sizes: {batch_sizes} (min={min(batch_sizes)}, max={max(batch_sizes)}, "
+                  f"avg={sum(batch_sizes)/len(batch_sizes):.1f})",
+                  category="setup", force=True)
+    else:
+        step = batch_size - temporal_overlap if temporal_overlap > 0 else batch_size
+        if step <= 0:
+            step = batch_size
+            temporal_overlap = 0
+            debug.log(f"temporal_overlap >= batch_size, resetting to 0", level="WARNING", category="setup", force=True)
+        
+        # Standard overlap-based batching
+        batch_iterator = []
+        for batch_idx in range(0, total_frames, step):
+            end_idx = min(batch_idx + batch_size, total_frames)
+            if batch_idx > 0 and end_idx - batch_idx <= temporal_overlap:
+                break
+            batch_iterator.append((batch_idx, end_idx))
     
     # Store actual temporal overlap used (may differ from parameter if reset)
     ctx['actual_temporal_overlap'] = temporal_overlap
     
     # Calculate number of batches
-    num_encode_batches = 0
-    for idx in range(0, total_frames, step):
-        end_idx = min(idx + batch_size, total_frames)
-        if idx > 0 and end_idx - idx <= temporal_overlap:
-            break
-        num_encode_batches += 1
+    num_encode_batches = len(batch_iterator)
     
     # Pre-allocate lists for memory efficiency
     ctx['all_latents'] = [None] * num_encode_batches
@@ -329,9 +348,9 @@ def encode_all_batches(
         seed_vae = seed + 1000000
         set_seed(seed_vae)
         debug.log(f"Using seed: {seed_vae} (VAE uses seed+1000000 for deterministic sampling)", category="vae")
-        
+
         # Move VAE to GPU for encoding (no-op if already there)
-        manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
+        manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
                           model_name="VAE", debug=debug, runner=runner)
         
         debug.log_memory_state("After VAE loading for encoding", detailed_tensors=False)
@@ -342,20 +361,11 @@ def encode_all_batches(
             debug.log("Tile debug enabled: encode tile boundaries will be visualized", category="vae", force=True)
             debug.log("Remember to disable --tile_debug in production to remove overlay visualization", category="tip", indent_level=1, force=True)
         
+        # batch_iterator already computed above (dynamic or standard)
+        
         # Process encoding
-        for batch_idx in range(0, total_frames, step):
+        for (start_idx, end_idx) in batch_iterator:
             check_interrupt(ctx)
-            
-            # Calculate indices with temporal overlap
-            if batch_idx == 0:
-                start_idx = 0
-                end_idx = min(batch_size, total_frames)
-            else:
-                start_idx = batch_idx
-                end_idx = min(start_idx + batch_size, total_frames)
-                if end_idx - start_idx <= temporal_overlap:
-                    break
-            
             current_frames = end_idx - start_idx
             is_uniform_padding = uniform_batch_size and current_frames < batch_size
             
@@ -809,7 +819,7 @@ def decode_all_batches(
     ctx: Dict[str, Any],
     debug: 'Debug',
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
-    cache_model: bool = False
+    cache_model: bool = False,
 ) -> Dict[str, Any]:
     """
     Phase 3: VAE Decoding.
@@ -890,7 +900,7 @@ def decode_all_batches(
     
     current_write_idx = 0
     decode_idx = 0
-    
+
     try:
         # VAE should already be materialized from encoding phase
         if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
@@ -900,7 +910,7 @@ def decode_all_batches(
         ensure_precision_initialized(ctx, runner, debug)
 
         # Move VAE to GPU for decoding (no-op if already there)
-        manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
+        manage_model_device(model=runner.vae, target_device=ctx['vae_device'],
                           model_name="VAE", debug=debug, runner=runner)
         
         debug.log_memory_state("After VAE loading for decoding", detailed_tensors=False)
@@ -980,16 +990,34 @@ def decode_all_batches(
                     # Blend overlapping region in-place on final_video
                     prev_tail = ctx['final_video'][current_write_idx - temporal_overlap:current_write_idx]
                     cur_head = sample[:temporal_overlap]
-                    
+
                     # Move to same device for blending if needed
                     if prev_tail.device != cur_head.device:
                         cur_head = cur_head.to(prev_tail.device)
+
+                    # Use motion-aware blending if motion analysis is available
+                    motion_boundaries = ctx.get('motion_boundaries')
+                    input_frames = ctx.get('input_frames')
+                    debug.log(f"Intra-GPU overlap blend at frames {current_write_idx - temporal_overlap}-{current_write_idx} "
+                              f"(motion_boundaries={'yes' if motion_boundaries else 'no'}, "
+                              f"input_frames={'yes' if input_frames is not None else 'no'})",
+                              category="motion", indent_level=1)
+                    if motion_boundaries and input_frames is not None:
+                        blended, strategy = motion_aware_blend(
+                            prev_tail, cur_head, temporal_overlap,
+                            motion_boundaries=motion_boundaries,
+                            overlap_frame_idx=current_write_idx - temporal_overlap,
+                            input_frames=input_frames,
+                            debug=debug,
+                        )
+                        debug.log(f"  -> motion_aware_blend result: strategy={strategy}",
+                                 category="motion", indent_level=2)
+                    else:
+                        blended = blend_overlapping_frames(prev_tail, cur_head, temporal_overlap)
+                        debug.log(f"  -> standard blend (no motion data available)",
+                                 category="motion", indent_level=2)
                     
-                    blended = blend_overlapping_frames(prev_tail, cur_head, temporal_overlap)
                     ctx['final_video'][current_write_idx - temporal_overlap:current_write_idx] = blended
-                    
-                    debug.log(f"Blended {temporal_overlap} overlapping frames at positions {current_write_idx - temporal_overlap}-{current_write_idx}", 
-                             category="video", indent_level=1)
                     
                     # Write only non-overlapping part
                     sample = sample[temporal_overlap:]
@@ -1294,32 +1322,59 @@ def postprocess_all_batches(
                         reason="color correction",
                         indent_level=1
                     )
-                    
-                # Apply selected color correction method
-                debug.start_timer(f"color_correction_{color_correction}")
                 
-                if color_correction == "lab":
-                    debug.log("Applying LAB perceptual color transfer", category="video", force=True, indent_level=1)
-                    sample = lab_color_transfer(sample, input_video, debug, luminance_weight=0.8)
-                elif color_correction == "wavelet_adaptive":
-                    debug.log("Applying wavelet with adaptive saturation correction", category="video", force=True, indent_level=1)
-                    sample = wavelet_adaptive_color_correction(sample, input_video, debug)
-                elif color_correction == "wavelet":
-                    debug.log("Applying wavelet color reconstruction", category="video", force=True, indent_level=1)
-                    sample = wavelet_reconstruction(sample, input_video, debug)
-                elif color_correction == "hsv":
-                    debug.log("Applying HSV hue-conditional saturation matching", category="video", force=True, indent_level=1)
-                    sample = hsv_saturation_histogram_match(sample, input_video, debug)
-                elif color_correction == "adain":
-                    debug.log("Applying AdaIN color correction", category="video", force=True, indent_level=1)
-                    sample = adaptive_instance_normalization(sample, input_video)
-                else:
-                    debug.log(f"Unknown color correction method: {color_correction}", level="WARNING", category="video", force=True, indent_level=1)
+                # Process in temporal chunks to avoid OOM from fragmented GPU memory.
+                # After pipeline parallelism, GPU has ~20GB allocated with fragmented free space.
+                # Processing full batches at once can exceed contiguous free blocks.
+                chunk_size = 1  # Process 1 frame at a time to minimize peak VRAM
+                num_frames = sample.shape[0]
+                corrected_chunks = []
+                
+                debug.start_timer(f"color_correction_{color_correction}")
+                for c_start in range(0, num_frames, chunk_size):
+                    c_end = min(c_start + chunk_size, num_frames)
+                    
+                    sample_chunk = sample[c_start:c_end]
+                    input_chunk = input_video[c_start:c_end]
+                    
+                    if color_correction == "lab":
+                        debug.log(f"  Applying LAB color transfer (frames {c_start}-{c_end})",
+                                  category="video", indent_level=2)
+                        corrected = lab_color_transfer(sample_chunk, input_chunk, debug, luminance_weight=0.8)
+                    elif color_correction == "wavelet_adaptive":
+                        debug.log(f"  Applying wavelet adaptive (frames {c_start}-{c_end})",
+                                  category="video", indent_level=2)
+                        corrected = wavelet_adaptive_color_correction(sample_chunk, input_chunk, debug)
+                    elif color_correction == "wavelet":
+                        debug.log(f"  Applying wavelet (frames {c_start}-{c_end})",
+                                  category="video", indent_level=2)
+                        corrected = wavelet_reconstruction(sample_chunk, input_chunk, debug)
+                    elif color_correction == "hsv":
+                        debug.log(f"  Applying HSV (frames {c_start}-{c_end})",
+                                  category="video", indent_level=2)
+                        corrected = hsv_saturation_histogram_match(sample_chunk, input_chunk, debug)
+                    elif color_correction == "adain":
+                        debug.log(f"  Applying AdaIN (frames {c_start}-{c_end})",
+                                  category="video", indent_level=2)
+                        corrected = adaptive_instance_normalization(sample_chunk, input_chunk)
+                    else:
+                        debug.log(f"Unknown color correction method: {color_correction}", level="WARNING",
+                                  category="video", force=True, indent_level=1)
+                        corrected = sample_chunk
+                    
+                    corrected_chunks.append(corrected)
+                    
+                    # Free chunk intermediates immediately
+                    del sample_chunk, input_chunk, corrected
                 
                 debug.end_timer(f"color_correction_{color_correction}", f"Color correction ({color_correction})")
                 
                 # Free the reconstructed transformed video
                 del input_video
+                
+                # Concatenate all corrected chunks
+                sample = torch.cat(corrected_chunks, dim=0)
+                del corrected_chunks
 
                 # Recombine with Alpha if it was present in input
                 if has_alpha and alpha_channel is not None:

@@ -16,6 +16,36 @@ from math import ceil
 from typing import Tuple
 import math
 
+# Global flag to disable temporal shifting in shifted-window layers.
+_temporal_window_isolation = False
+
+# Global cap on temporal window size (in frames).
+# When > 0, limits the number of frames that attend to each other in each temporal window.
+_temporal_window_size_cap = 0
+
+
+def set_temporal_window_isolation(enabled: bool):
+    """Enable/disable temporal window isolation."""
+    global _temporal_window_isolation
+    _temporal_window_isolation = enabled
+
+
+def get_temporal_window_isolation() -> bool:
+    """Get current temporal window isolation state."""
+    return _temporal_window_isolation
+
+
+def set_temporal_window_size_cap(cap: int):
+    """Set maximum temporal window size (in frames)."""
+    global _temporal_window_size_cap
+    _temporal_window_size_cap = max(0, cap)
+
+
+def get_temporal_window_size_cap() -> int:
+    """Get current temporal window size cap."""
+    return _temporal_window_size_cap
+
+
 def get_window_op(name: str):
     if name == "720pwin_by_size_bysize":
         return make_720Pwindows_bysize
@@ -33,6 +63,9 @@ def make_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tuple[int, 
     resized_h, resized_w = round(h * scale), round(w * scale)
     wh, ww = ceil(resized_h / resized_nh), ceil(resized_w / resized_nw)  # window size.
     wt = ceil(min(t, 30) / resized_nt)  # window size.
+    # Apply temporal window size cap to limit temporal receptive field
+    if _temporal_window_size_cap > 0:
+        wt = min(wt, _temporal_window_size_cap)
     nt, nh, nw = ceil(t / wt), ceil(h / wh), ceil(w / ww)  # window size.
     return [
         (
@@ -58,15 +91,15 @@ def make_shifted_720Pwindows_bysize(size: Tuple[int, int, int], num_windows: Tup
     wt = ceil(min(t, 30) / resized_nt)  # window size.
     
     st, sh, sw = (  # shift size.
-        0.5 if wt < t else 0,
+        0.0 if _temporal_window_isolation else (0.5 if wt < t else 0),
         0.5 if wh < h else 0,
         0.5 if ww < w else 0,
     )
     nt, nh, nw = ceil((t - st) / wt), ceil((h - sh) / wh), ceil((w - sw) / ww)  # window size.
     nt, nh, nw = (  # number of window.
-        nt + 1 if st > 0 else 1,
-        nh + 1 if sh > 0 else 1,
-        nw + 1 if sw > 0 else 1,
+        nt + 1 if st > 0 else ceil(t / wt),
+        nh + 1 if sh > 0 else ceil(h / wh),
+        nw + 1 if sw > 0 else ceil(w / ww),
     )
     return [
         (

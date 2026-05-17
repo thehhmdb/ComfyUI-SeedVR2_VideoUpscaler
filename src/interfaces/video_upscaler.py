@@ -195,6 +195,41 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                         "Can soften details if input_noise_scale doesn't help."
                     )
                 ),
+                io.Combo.Input("motion_compensation",
+                    options=["auto", "enabled", "disabled"],
+                    default="auto",
+                    optional=True,
+                    tooltip=(
+                        "Motion-aware temporal blending for scene cuts and fast camera movement (default: auto).\n"
+                        "Uses optical flow to detect motion between frames and adjust blending accordingly.\n"
+                        "\n"
+                        "• auto: Enable when temporal_overlap > 0 or prepend_frames > 0\n"
+                        "• enabled: Always enable motion analysis\n"
+                        "• disabled: Never enable (standard blending only)\n"
+                        "\n"
+                        "Prevents ghosting artifacts when:\n"
+                        "- Scene cuts occur between consecutive frames\n"
+                        "- Fast camera panning or zooming\n"
+                        "- Objects moving significantly between frames"
+                    )
+                ),
+                io.Float.Input("motion_sensitivity",
+                    default=0.5,
+                    min=0.0,
+                    max=1.0,
+                    step=0.05,
+                    optional=True,
+                    tooltip=(
+                        "Sensitivity of motion detection (default: 0.5).\n"
+                        "Controls how aggressively motion and scene cuts are classified.\n"
+                        "\n"
+                        "• Lower (0.0-0.3): Conservative - fewer scene cuts detected\n"
+                        "• Medium (0.3-0.7): Balanced - good for most content\n"
+                        "• Higher (0.7-1.0): Aggressive - more scene cuts detected\n"
+                        "\n"
+                        "If you see ghosting, increase sensitivity. If blending is too abrupt, decrease it."
+                    )
+                ),
                 io.Combo.Input("offload_device",
                     options=get_device_list(include_none=True, include_cpu=True),
                     default="cpu",
@@ -228,7 +263,8 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
                 seed: int, resolution: int = 1080, max_resolution: int = 0, batch_size: int = 5,
                 uniform_batch_size: bool = False, temporal_overlap: int = 0, prepend_frames: int = 0,
                 color_correction: str = "wavelet", input_noise_scale: float = 0.0,
-                latent_noise_scale: float = 0.0, offload_device: str = "none", 
+                latent_noise_scale: float = 0.0, motion_compensation: str = "auto",
+                motion_sensitivity: float = 0.5, offload_device: str = "none", 
                 enable_debug: bool = False) -> io.NodeOutput:
         """
         Execute SeedVR2 video upscaling with progress reporting
@@ -462,6 +498,38 @@ class SeedVR2VideoUpscaler(io.ComfyNode):
             
             # Log generation start in consistent format
             log_generation_start(gen_info, debug)
+            
+            # Motion analysis for scene-cut and fast-motion detection
+            motion_enabled = False
+            if temporal_overlap > 0 or prepend_frames > 0:
+                if motion_compensation == "auto" or motion_compensation == "enabled":
+                    from ..core.motion_analysis import compute_motion_analysis
+                    debug.log("Computing motion analysis for temporal blending...", category="motion")
+                    debug.start_timer("motion_analysis")
+                    motion_boundaries = compute_motion_analysis(
+                        image, sensitivity=motion_sensitivity, downscale=96, return_flow=False
+                    )
+                    ctx['motion_boundaries'] = motion_boundaries
+                    ctx['input_frames'] = image  # Reference for flow computation during blending
+                    motion_enabled = True
+                    
+                    # Summarize motion analysis results
+                    scene_cuts = [b for b in motion_boundaries if b.type.value == "scene_cut"]
+                    motions = [b for b in motion_boundaries if b.type.value == "motion"]
+                    debug.log(f"Motion analysis complete: {len(motion_boundaries)} boundaries analyzed",
+                             category="motion")
+                    if scene_cuts:
+                        debug.log(f"  Scene cuts detected at frames: {[i+1 for i, b in enumerate(motion_boundaries) if b.type.value == 'scene_cut']}",
+                                 category="motion", indent_level=1)
+                    if motions:
+                        debug.log(f"  Motion boundaries: {len(motions)} (consistent motion detected)",
+                                 category="motion", indent_level=1)
+                    if not scene_cuts and not motions:
+                        debug.log("  All frames classified as static (minimal motion)",
+                                 category="motion", indent_level=1)
+                    debug.end_timer("motion_analysis", "Motion analysis", show_breakdown=True)
+                elif motion_compensation == "disabled":
+                    debug.log("Motion compensation disabled by user", category="motion")
             
             debug.start_timer("generation")
             
