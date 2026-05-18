@@ -38,6 +38,10 @@ class SideResize:
         """
         Resize image with shortest edge set to size, optionally limiting longest edge.
         
+        For large video tensors (batch dimension > 1), processes frames in chunks
+        to reduce peak VRAM usage during bicubic interpolation which allocates
+        large intermediate buffers proportional to input × output size.
+        
         Args:
             image (PIL Image or Tensor): Image to be scaled.
 
@@ -59,6 +63,50 @@ class SideResize:
 
         # Resize to shortest edge (disable antialias only for MPS tensors - not supported)
         antialias = not (isinstance(image, torch.Tensor) and image.device.type == 'mps')
+        
+        # For large video tensors on GPU, process in chunks to reduce peak VRAM.
+        # Bicubic interpolation allocates intermediate buffers proportional to
+        # input × output size, which can cause OOM on large batches.
+        if isinstance(image, torch.Tensor) and image.is_cuda and image.dim() >= 4:
+            batch_size = image.shape[0]
+            # Compute expected output dimensions
+            aspect = max(width, height) / min(width, height)
+            new_short = size
+            _out_h = int(height / min(height, width) * new_short)
+            _out_w = int(width / min(height, width) * new_short)
+            
+            # Estimate peak memory needed per frame (input + output + intermediate buffers)
+            # Bicubic AA typically needs ~4-8x the output size for intermediate buffers
+            input_bytes_per_frame = image.element_size() * image.shape[1] * height * width
+            output_bytes_per_frame = image.element_size() * image.shape[1] * _out_h * _out_w
+            # Conservative estimate: 6x output for intermediate buffers
+            peak_bytes_per_frame = input_bytes_per_frame + output_bytes_per_frame + 6 * output_bytes_per_frame
+            peak_gb_per_frame = peak_bytes_per_frame / (1024**3)
+            
+            # Check if we need chunking: if processing all frames would use > 8GB peak
+            if peak_gb_per_frame * batch_size > 8:
+                # Calculate safe chunk size
+                max_frames = max(1, int(8 / peak_gb_per_frame))
+                chunks = []
+                for i in range(0, batch_size, max_frames):
+                    end = min(i + max_frames, batch_size)
+                    chunk = image[i:end]
+                    resized_chunk = TVF.resize(chunk, size, self.interpolation, antialias=antialias)
+                    
+                    # Apply max_size constraint if needed
+                    if self.max_size > 0:
+                        h, w = resized_chunk.shape[-2:]
+                        if max(h, w) > self.max_size:
+                            scale = self.max_size / max(h, w)
+                            new_h, new_w = round(h * scale), round(w * scale)
+                            resized_chunk = TVF.resize(resized_chunk, (new_h, new_w), self.interpolation, antialias=antialias)
+                    
+                    chunks.append(resized_chunk)
+                    del chunk  # Free input chunk immediately
+                resized = torch.cat(chunks, dim=0)
+                del chunks
+                return resized
+        
         resized = TVF.resize(image, size, self.interpolation, antialias=antialias)
         
         # Apply max_size constraint if specified

@@ -1420,6 +1420,11 @@ def _process_frames_core_with_pipeline(
     # === Phase 1: VAE Encode on GPU 0 ===
     materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
 
+    # Temporarily remove DiT reference during VAE encoding to prevent
+    # implicit materialization on GPU 0 during resize operations.
+    dit_model_backup = runner.dit
+    runner.dit = None
+
     ctx = encode_all_batches(
         runner, ctx=ctx, images=frames_tensor,
         debug=debug,
@@ -1434,6 +1439,9 @@ def _process_frames_core_with_pipeline(
         color_correction=args.color_correction,
         batch_ranges=batch_ranges,
     )
+
+    # Restore DiT reference after VAE encoding completes
+    runner.dit = dit_model_backup
 
     # Move VAE to CPU before DiT (can't delete - materialize_model can't re-load)
     runner.vae = runner.vae.to("cpu")

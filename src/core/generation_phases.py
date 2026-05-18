@@ -355,6 +355,30 @@ def encode_all_batches(
         
         debug.log_memory_state("After VAE loading for encoding", detailed_tensors=False)
 
+        # Diagnostic: Check DiT device state before encoding loop to find premature materialization
+        if runner.dit is not None:
+            try:
+                dit_dev = next(runner.dit.parameters()).device
+                debug.log(f"  [DIAG] DiT device before encoding loop: {dit_dev}",
+                          category="pipeline", force=True)
+            except StopIteration:
+                debug.log(f"  [DIAG] DiT has no parameters before encoding loop",
+                          category="pipeline", force=True)
+        else:
+            debug.log(f"  [DIAG] DiT is None before encoding loop",
+                      category="pipeline", force=True)
+
+        # Diagnostic: Synchronized GPU memory check before encoding loop
+        for d in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(f"cuda:{d}")
+            alloc = torch.cuda.memory_allocated(f"cuda:{d}") / (1024**3)
+            reserved = torch.cuda.memory_reserved(f"cuda:{d}") / (1024**3)
+            free_phys, total_phys = torch.cuda.mem_get_info(f"cuda:{d}")
+            free_gb = free_phys / (1024**3)
+            total_gb = total_phys / (1024**3)
+            debug.log(f"  [DIAG] GPU {d} before encoding loop (synced): {alloc:.2f}GB alloc, {reserved:.2f}GB reserved, {free_gb:.2f}GB free / {total_gb:.2f}GB total",
+                      category="pipeline", force=True)
+
         # Initialize tile_boundaries for encoding debug
         if runner.tile_debug == "encode" and runner.encode_tiled:
             debug.encode_tile_boundaries = []

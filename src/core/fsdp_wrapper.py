@@ -271,7 +271,7 @@ class PipelineDiTWrapper(torch.nn.Module):
             for i, parts in enumerate(partitions_fine):
                 gpu_idx = i % num_gpus
                 self.debug.log(f"  Stage {i} ({device_list_extended[i]} / GPU {gpu_idx}): blocks {parts}",
-                              category="pipeline", force=True)
+                              category="pipeline")
 
         block_count = 0
         activations_on_cpu = False  # Track whether activations are on CPU
