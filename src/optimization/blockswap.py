@@ -312,20 +312,29 @@ def _configure_io_components(
     io_components_on_gpu = []
     io_memory_mb = 0.0
     io_gpu_memory_mb = 0.0
-    
+
+    def _move_module(module: torch.nn.Module, target_device: torch.device):
+        """Move a module to target_device, handling meta tensors via to_empty()."""
+        has_meta = any(p.device.type == 'meta' for p in module.parameters())
+        if has_meta:
+            # Materialize meta tensors to target device using to_empty (no data copy needed)
+            module.to_empty(device=target_device, recurse=True)
+        else:
+            module.to(target_device)
+
     # Handle I/O modules with dynamic swapping
     for name, module in model.named_children():
         if name != "blocks":
             module_memory = get_module_memory_mb(module)
             
             if swap_io_components:
-                module.to(offload_device)
+                _move_module(module, offload_device)
                 _wrap_io_forward(module, name, model, debug)
                 io_components_offloaded.append(name)
                 io_memory_mb += module_memory
                 debug.log(f"{name} → {str(offload_device).upper()} ({module_memory:.2f}MB, dynamic swapping)", category="blockswap", indent_level=1)
             else:
-                module.to(device)
+                _move_module(module, device)
                 io_components_on_gpu.append(name)
                 io_gpu_memory_mb += module_memory
                 debug.log(f"{name} → {str(device).upper()} ({module_memory:.2f}MB)", category="blockswap", indent_level=1)
@@ -369,19 +378,24 @@ def _configure_blocks(
     # Move blocks based on swap configuration
     for b, block in enumerate(model.blocks):
         block_memory = get_module_memory_mb(block)
+        target_device = device if b > model.blocks_to_swap else offload_device
 
-        if b > model.blocks_to_swap:
-            block.to(device)
-            total_main_memory += block_memory
+        has_meta = any(p.device.type == 'meta' for p in block.parameters())
+        if has_meta:
+            block.to_empty(device=target_device, recurse=True)
         else:
-            block.to(offload_device, non_blocking=False)
-            total_offload_memory += block_memory
+            block.to(target_device, non_blocking=False)
+
+        total_offload_memory += block_memory if b <= model.blocks_to_swap else 0
+        total_main_memory += block_memory if b > model.blocks_to_swap else 0
 
     # Ensure all buffers match their containing module's device
     for b, block in enumerate(model.blocks):
         target_device = device if b > model.blocks_to_swap else offload_device
         for name, buffer in block.named_buffers():
-            if buffer.device != torch.device(target_device):
+            if buffer.device.type == 'meta':
+                buffer.data = torch.empty_like(buffer.data, device=target_device)
+            elif buffer.device != torch.device(target_device):
                 buffer.data = buffer.data.to(target_device, non_blocking=False)
 
     return {

@@ -24,7 +24,7 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 import torch
 
 
@@ -39,6 +39,7 @@ class SpatialTilingConfig:
     tile_size: int = 0           # Tile size in patch coords (0 = disabled)
     overlap: int = 0             # Overlap in patch coords between adjacent tiles
     min_tile_size: int = 16      # Minimum tile size (below this, tiling is disabled)
+    auto_tile_size: bool = False # Auto-select tile size per-batch based on VRAM
 
     @property
     def enabled(self) -> bool:
@@ -48,6 +49,328 @@ class SpatialTilingConfig:
     def effective_stride(self) -> int:
         """Stride between tile starts (tile_size - overlap)."""
         return max(self.tile_size - self.overlap, 1)
+
+
+class SpatialTilingDiTWrapper(torch.nn.Module):
+    """
+    Wraps any DiT model and adds spatial tiling to the forward pass.
+
+    Splits the video into overlapping spatial tiles, processes each tile
+    through the full DiT forward pass independently, then stitches the
+    outputs back together with quadratic overlap blending.
+
+    This is the non-FSDP equivalent of the spatial tiling logic in
+    PipelineDiTWrapper.forward(). Used when running on a single GPU
+    without pipeline parallelism.
+
+    Usage:
+        wrapper = SpatialTilingDiTWrapper(dit_model, device, tile_size=64, overlap=32)
+        output = wrapper(vid, txt, vid_shape, txt_shape, timestep)
+    """
+
+    def __init__(
+        self,
+        dit_model: torch.nn.Module,
+        device: torch.device,
+        debug: Optional[Any] = None,
+        spatial_tile_size: int = 0,
+        spatial_tile_overlap: int = 0,
+        auto_tile_size: bool = False,
+    ):
+        super().__init__()
+        self.dit_model = dit_model
+        self.device = device
+        self.debug = debug
+
+        self.spatial_config = SpatialTilingConfig(
+            tile_size=spatial_tile_size,
+            overlap=spatial_tile_overlap,
+            auto_tile_size=auto_tile_size,
+        )
+
+        if debug:
+            if self.spatial_config.enabled:
+                debug.log(f"SpatialTilingDiTWrapper: Spatial tiling enabled "
+                          f"(tile={self.spatial_config.tile_size}px, "
+                          f"overlap={self.spatial_config.overlap}px, "
+                          f"stride={self.spatial_config.effective_stride}px)",
+                          category="tiling", force=True)
+            elif auto_tile_size:
+                debug.log(f"SpatialTilingDiTWrapper: Auto tile size enabled "
+                          f"(will probe VRAM per-batch)",
+                          category="tiling", force=True)
+
+    def forward(
+        self,
+        vid: torch.Tensor,
+        txt: torch.Tensor,
+        vid_shape: torch.Tensor,
+        txt_shape: torch.Tensor,
+        timestep: torch.Tensor,
+        **kwargs,
+    ):
+        """
+        Forward pass with optional spatial tiling.
+
+        If spatial tiling is enabled, the video is split into overlapping spatial
+        tiles. Each tile is processed through the full DiT forward, then stitched
+        back together with overlap blending.
+
+        If spatial tiling is disabled, delegates directly to the wrapped DiT model.
+        """
+        # Auto tile size: probe VRAM and compute optimal tile size for this batch
+        effective_tile_size = self.spatial_config.tile_size
+        if self.spatial_config.auto_tile_size and self.spatial_config.tile_size == 0:
+            t_val = int(vid_shape[0, 0].item())
+            h_val = int(vid_shape[0, 1].item())
+            w_val = int(vid_shape[0, 2].item())
+
+            free_vram, _ = torch.cuda.mem_get_info(self.device)
+
+            vid_dim = self.dit_model.vid_in.proj.out_features
+            dtype_bytes = vid.element_size()
+            patch_size = self.dit_model.vid_in.patch_size  # (pt, ph, pw)
+
+            effective_tile_size = estimate_optimal_tile_size(
+                vid_dim=vid_dim,
+                t=t_val,
+                h=h_val,
+                w=w_val,
+                dtype_bytes=dtype_bytes,
+                free_vram_bytes=free_vram,
+                min_tile_size=self.spatial_config.min_tile_size,
+                patch_size=tuple(patch_size),
+            )
+
+            if self.debug:
+                free_gb = free_vram / (1024**3)
+                if effective_tile_size == 0:
+                    self.debug.log(
+                        f"Auto tile: disabled (full {t_val}x{h_val}x{w_val} fits in {free_gb:.1f}GB free VRAM)",
+                        category="tiling", force=True,
+                    )
+                else:
+                    self.debug.log(
+                        f"Auto tile: {effective_tile_size} (batch T={t_val}, H={h_val}, W={w_val}, "
+                        f"free={free_gb:.1f}GB, vid_dim={vid_dim})",
+                        category="tiling", force=True,
+                    )
+
+        if self.spatial_config.enabled or (self.spatial_config.auto_tile_size and effective_tile_size > 0):
+            return self._forward_tiled(
+                vid, txt, vid_shape, txt_shape, timestep,
+                effective_tile_size, **kwargs,
+            )
+        else:
+            # No tiling - run single forward
+            return self.dit_model(
+                vid=vid,
+                txt=txt,
+                vid_shape=vid_shape,
+                txt_shape=txt_shape,
+                timestep=timestep,
+                **kwargs,
+            )
+
+    def _forward_tiled(
+        self,
+        vid: torch.Tensor,
+        txt: torch.Tensor,
+        vid_shape: torch.Tensor,
+        txt_shape: torch.Tensor,
+        timestep: torch.Tensor,
+        effective_tile_size: int,
+        **kwargs,
+    ):
+        """Forward pass with spatial tiling applied."""
+        from src.core.spatial_tiling import (
+            generate_tile_grid,
+            extract_tile_from_flat,
+            stitch_tiles_to_flat,
+        )
+
+        device = vid.device
+        dtype = vid.dtype
+        c_val = vid.shape[1]
+
+        t_val = int(vid_shape[0, 0].item())
+        h_val = int(vid_shape[0, 1].item())
+        w_val = int(vid_shape[0, 2].item())
+
+        active_tile_size = effective_tile_size if effective_tile_size > 0 else self.spatial_config.tile_size
+        active_overlap = self.spatial_config.overlap
+        active_stride = max(active_tile_size - active_overlap, 1)
+
+        tile_grid = generate_tile_grid(
+            h_val, w_val,
+            active_tile_size,
+            active_overlap,
+        )
+
+        if self.debug:
+            self.debug.log(
+                f"Spatial tiling: {h_val}x{w_val} (patch coords) -> {len(tile_grid)} tiles "
+                f"(tile={active_tile_size}, overlap={active_overlap}, stride={active_stride})",
+                category="tiling", force=True,
+            )
+
+        tile_outputs = []
+        tile_slices = []
+
+        for i, (h_slice, w_slice) in enumerate(tile_grid):
+            tile_vid, tile_vid_shape = extract_tile_from_flat(
+                vid, vid_shape, h_slice, w_slice,
+            )
+
+            tile_out = self.dit_model(
+                vid=tile_vid,
+                txt=txt,
+                vid_shape=tile_vid_shape,
+                txt_shape=txt_shape,
+                timestep=timestep,
+                **kwargs,
+            )
+
+            if hasattr(tile_out, 'vid_sample'):
+                tile_out = tile_out.vid_sample
+
+            tile_outputs.append(tile_out)
+            tile_slices.append((h_slice, w_slice))
+
+            del tile_vid, tile_vid_shape, tile_out
+
+            if self.debug:
+                self.debug.log(f"  Tile {i + 1}/{len(tile_grid)} complete",
+                              category="tiling", force=True)
+
+        # Single VRAM cleanup after all tiles processed
+        import gc
+        gc.collect()
+        torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+
+        patch_size = self.dit_model.vid_in.patch_size  # (pt, ph, pw)
+
+        result = stitch_tiles_to_flat(
+            tile_outputs, tile_slices,
+            t_val, h_val, w_val, c_val,
+            active_overlap,
+            patch_size,
+            device, dtype,
+        )
+
+        if self.debug:
+            self.debug.log(
+                f"Spatial tiling: stitched {len(tile_outputs)} tiles -> {tuple(result.shape)}",
+                category="tiling", force=True,
+            )
+
+        try:
+            from src.models.dit_7b.nadit import NaDiTOutput
+        except ImportError:
+            from src.models.dit_3b.nadit import NaDiTOutput
+        return NaDiTOutput(vid_sample=result)
+
+
+def estimate_optimal_tile_size(
+    vid_dim: int,
+    t: int,
+    h: int,
+    w: int,
+    dtype_bytes: int,
+    free_vram_bytes: int,
+    min_tile_size: int = 32,
+    patch_size: Tuple[int, int, int] = (1, 2, 2),
+) -> int:
+    """
+    Estimate the optimal spatial tile size based on available VRAM and batch dimensions.
+
+    Uses an analytical VRAM cost model to find the largest tile size that fits
+    within available VRAM. Per-tile peak VRAM scales linearly with token count
+    (T x tile_h x tile_w), so larger batches need smaller tiles.
+
+    Args:
+        vid_dim: Model hidden dimension (e.g., 3072 for 7B, 2560 for 3B)
+        t: Temporal dimension (number of frames in batch) in patch coords
+        h: Height in patch coords
+        w: Width in patch coords
+        dtype_bytes: Bytes per element (2 for fp16/bf16, 4 for fp32)
+        free_vram_bytes: Free VRAM on the target GPU in bytes
+        min_tile_size: Minimum tile size (below this, tiling is forced off)
+        patch_size: Model patch size (pt, ph, pw), e.g. (1, 2, 2)
+
+    Returns:
+        Optimal tile size in patch coords, or 0 if full image fits without tiling.
+    """
+    # Safety margin - use 80% of free VRAM to avoid edge-case OOM
+    safety_margin = 0.8
+    usable_vram = free_vram_bytes * safety_margin
+
+    # Estimate per-block weight size (one block loaded to GPU at a time in pipeline mode)
+    # A transformer block has ~2 linear layers (QKV+out) + MLP (gate+up+down)
+    # Each linear: vid_dim * vid_dim * dtype_bytes
+    # Rough estimate: 4-5 linear layers per block
+    per_block_weights = vid_dim * vid_dim * dtype_bytes * 5
+
+    # Fixed overhead: I/O layers (vid_in, txt_in, emb_in, vid_out) + text embeddings
+    # vid_in: ~vid_in_channels * patch_size * vid_dim
+    # txt_in + emb_in + vid_out: ~3 * vid_dim^2
+    # Text embeddings: ~77 * txt_dim (small)
+    fixed_overhead = vid_dim * vid_dim * dtype_bytes * 4 + 1e9  # ~4 linear + 1GB buffer
+
+    # Available VRAM for activations after weights and fixed overhead
+    available_for_activations = usable_vram - per_block_weights - fixed_overhead
+
+    if available_for_activations <= 0:
+        # Very constrained - use minimum tile size
+        return min_tile_size
+
+    # Activation bytes per token: vid_dim * dtype_bytes * activation_multiplier
+    # Multiplier ~5 accounts for: attention intermediates (Q,K,V,O), MLP (gate,up,down),
+    # residual connections, and normalization buffers
+    activation_multiplier = 5
+    activation_bytes_per_token = vid_dim * dtype_bytes * activation_multiplier
+
+    # Check if full image fits without tiling
+    total_tokens = t * h * w
+    full_image_activation_vram = total_tokens * activation_bytes_per_token
+
+    if full_image_activation_vram <= available_for_activations:
+        return 0  # No tiling needed
+
+    # Binary search for max tile_size where per-tile VRAM fits
+    # Tokens per tile = t * tile_h * tile_w
+    # We want: t * tile_size^2 * activation_bytes_per_token <= available_for_activations
+    # tile_size <= sqrt(available / (t * activation_bytes_per_token))
+
+    tokens_per_spatial_pixel = t
+    vram_per_spatial_pixel = tokens_per_spatial_pixel * activation_bytes_per_token
+
+    if vram_per_spatial_pixel <= 0:
+        return min_tile_size
+
+    max_tile_size = int((available_for_activations / vram_per_spatial_pixel) ** 0.5)
+
+    # Clamp to valid range
+    max_tile_size = max(min_tile_size, max_tile_size)
+    max_tile_size = min(max_tile_size, max(h, w))  # Can't be larger than latent dims
+
+    # Round down to a multiple of patch_size for spatial dimensions.
+    # The model's patch embedding requires tile dimensions to be divisible
+    # by the patch size (e.g., patch_size=[1,2,2] means spatial dims must be even).
+    ph, pw = patch_size[1], patch_size[2]
+    import math
+    lcm_val = ph  # Assume ph == pw for simplicity (common case)
+    if ph != pw:
+        lcm_val = ph * pw // math.gcd(ph, pw)
+    if lcm_val > 1:
+        max_tile_size = (max_tile_size // lcm_val) * lcm_val
+
+    # If rounding makes tile too small, return 0 (no tiling) rather than a broken tile
+    if max_tile_size < min_tile_size:
+        return 0
+
+    return max_tile_size
 
 
 def generate_tile_slices(
@@ -259,26 +582,28 @@ def stitch_tiles_to_flat(
         weight_w = torch.ones(tile_w, device=device, dtype=dtype)
 
         if overlap > 0:
+            fade_len_h = min(overlap, tile_h)
+            fade_len_w = min(overlap, tile_w)
+
+            # Vectorized quadratic fade: (i/overlap)^2 for top/left, ((i+1)/overlap)^2 for bottom/right
+            # Replaces Python for-loops that iterated overlap times per edge.
+            fade_up = (torch.arange(fade_len_h, device=device, dtype=dtype) / overlap) ** 2
+            fade_down = (torch.arange(1, fade_len_h + 1, device=device, dtype=dtype) / overlap) ** 2
+            fade_left = (torch.arange(fade_len_w, device=device, dtype=dtype) / overlap) ** 2
+            fade_right = (torch.arange(1, fade_len_w + 1, device=device, dtype=dtype) / overlap) ** 2
+
             # Fade top edge only if this is NOT the first tile in H (h_start > 0)
             if h_start > 0:
-                for i in range(min(overlap, tile_h)):
-                    t_norm = i / overlap
-                    weight_h[i] = t_norm * t_norm
+                weight_h[:fade_len_h] = fade_up
             # Fade bottom edge only if this is NOT the last tile in H (h_end < h_val)
             if h_end < h_val:
-                for i in range(min(overlap, tile_h)):
-                    t_norm = (i + 1) / overlap
-                    weight_h[tile_h - 1 - i] = t_norm * t_norm
+                weight_h[-fade_len_h:] = fade_down.flip(0)
             # Fade left edge only if this is NOT the first tile in W (w_start > 0)
             if w_start > 0:
-                for i in range(min(overlap, tile_w)):
-                    t_norm = i / overlap
-                    weight_w[i] = t_norm * t_norm
+                weight_w[:fade_len_w] = fade_left
             # Fade right edge only if this is NOT the last tile in W (w_end < w_val)
             if w_end < w_val:
-                for i in range(min(overlap, tile_w)):
-                    t_norm = (i + 1) / overlap
-                    weight_w[tile_w - 1 - i] = t_norm * t_norm
+                weight_w[-fade_len_w:] = fade_right.flip(0)
 
         weight_map = weight_h.unsqueeze(1) * weight_w.unsqueeze(0)
         weight_map = weight_map.unsqueeze(-1)

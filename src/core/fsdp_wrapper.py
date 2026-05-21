@@ -54,6 +54,7 @@ class PipelineDiTWrapper(torch.nn.Module):
         debug: Optional[Any] = None,
         spatial_tile_size: int = 0,
         spatial_tile_overlap: int = 0,
+        auto_tile_size: bool = False,
     ):
         super().__init__()
         self.dit_model = dit_model
@@ -65,6 +66,7 @@ class PipelineDiTWrapper(torch.nn.Module):
         self.spatial_config = SpatialTilingConfig(
             tile_size=spatial_tile_size,
             overlap=spatial_tile_overlap,
+            auto_tile_size=auto_tile_size,
         )
 
         num_gpus = len(device_list)
@@ -308,13 +310,26 @@ class PipelineDiTWrapper(torch.nn.Module):
                 txt_shape = txt_shape.to("cpu", non_blocking=True)
                 activations_on_cpu = True
 
-                # Force CUDA memory release and defragment
-                torch.cuda.synchronize(current_device)
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                cache.cache.clear()
+                # Batched VRAM cleanup every 4 blocks instead of every block.
+                # gc.collect() + synchronize + empty_cache are expensive CPU-side
+                # operations (full GC sweep, GPU sync, allocator walk). Running
+                # them every block adds ~1-2s overhead across 36 blocks.
+                # Per-block CPU offload already frees VRAM; cleanup is just defragmentation.
                 block_count += 1
+                if block_count % 4 == 0:
+                    torch.cuda.synchronize(current_device)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    cache.cache.clear()
+                else:
+                    cache.cache.clear()
+
+        # Final cleanup after all blocks processed
+        if block_count % 4 != 0:
+            torch.cuda.synchronize(current_device)
+            gc.collect()
+            torch.cuda.empty_cache()
+            cache.cache.clear()
 
         # --- Final stage: Output layers on last GPU ---
         current_device = device_list[-1]
@@ -384,7 +399,49 @@ class PipelineDiTWrapper(torch.nn.Module):
 
         If spatial tiling is disabled, delegates directly to _pipeline_forward_single.
         """
-        if self.spatial_config.enabled:
+        # Auto tile size: probe VRAM and compute optimal tile size for this batch
+        effective_tile_size = self.spatial_config.tile_size
+        if self.spatial_config.auto_tile_size and self.spatial_config.tile_size == 0:
+            from src.core.spatial_tiling import estimate_optimal_tile_size
+
+            t_val = int(vid_shape[0, 0].item())
+            h_val = int(vid_shape[0, 1].item())
+            w_val = int(vid_shape[0, 2].item())
+
+            # Probe free VRAM on the primary GPU
+            free_vram, _ = torch.cuda.mem_get_info(self.device_list[0])
+
+            # Extract vid_dim from model (vid_in.proj is Linear(in, vid_dim))
+            vid_dim = self.dit_model.vid_in.proj.out_features
+            dtype_bytes = vid.element_size()
+
+            patch_size = self.dit_model.vid_in.patch_size  # (pt, ph, pw)
+            effective_tile_size = estimate_optimal_tile_size(
+                vid_dim=vid_dim,
+                t=t_val,
+                h=h_val,
+                w=w_val,
+                dtype_bytes=dtype_bytes,
+                free_vram_bytes=free_vram,
+                min_tile_size=self.spatial_config.min_tile_size,
+                patch_size=tuple(patch_size),
+            )
+
+            if self.debug:
+                free_gb = free_vram / (1024**3)
+                if effective_tile_size == 0:
+                    self.debug.log(
+                        f"Auto tile: disabled (full {t_val}x{h_val}x{w_val} fits in {free_gb:.1f}GB free VRAM)",
+                        category="tiling", force=True,
+                    )
+                else:
+                    self.debug.log(
+                        f"Auto tile: {effective_tile_size} (batch T={t_val}, H={h_val}, W={w_val}, "
+                        f"free={free_gb:.1f}GB, vid_dim={vid_dim})",
+                        category="tiling", force=True,
+                    )
+
+        if self.spatial_config.enabled or (self.spatial_config.auto_tile_size and effective_tile_size > 0):
             from src.core.spatial_tiling import (
                 generate_tile_grid,
                 extract_tile_from_flat,
@@ -400,19 +457,22 @@ class PipelineDiTWrapper(torch.nn.Module):
             h_val = int(vid_shape[0, 1].item())
             w_val = int(vid_shape[0, 2].item())
 
+            # Use effective tile size (auto-computed or user-specified)
+            active_tile_size = effective_tile_size if effective_tile_size > 0 else self.spatial_config.tile_size
+            active_overlap = self.spatial_config.overlap
+            active_stride = max(active_tile_size - active_overlap, 1)
+
             # Generate tile grid (in patch coords)
             tile_grid = generate_tile_grid(
                 h_val, w_val,
-                self.spatial_config.tile_size,
-                self.spatial_config.overlap,
+                active_tile_size,
+                active_overlap,
             )
 
             if self.debug:
                 self.debug.log(
                     f"Spatial tiling: {h_val}x{w_val} (patch coords) -> {len(tile_grid)} tiles "
-                    f"(tile={self.spatial_config.tile_size}, "
-                    f"overlap={self.spatial_config.overlap}, "
-                    f"stride={self.spatial_config.effective_stride})",
+                    f"(tile={active_tile_size}, overlap={active_overlap}, stride={active_stride})",
                     category="tiling", force=True,
                 )
 
@@ -439,17 +499,22 @@ class PipelineDiTWrapper(torch.nn.Module):
                 tile_outputs.append(tile_out)
                 tile_slices.append((h_slice, w_slice))
 
-                # Free memory between tiles
+                # Free intermediate tile tensors (lightweight - just Python ref drops)
                 del tile_vid, tile_vid_shape, tile_out
-                import gc
-                gc.collect()
-                for d in self.device_list:
-                    torch.cuda.synchronize(d)
-                    torch.cuda.empty_cache()
 
                 if self.debug:
                     self.debug.log(f"  Tile {i + 1}/{len(tile_grid)} complete",
                                   category="tiling", force=True)
+
+            # Single VRAM cleanup after all tiles processed (not per-tile).
+            # Per-tile gc.collect() + synchronize was the dominant CPU overhead
+            # in the tiling loop. The del statements above already release refs;
+            # one final cleanup is sufficient before stitching.
+            import gc
+            gc.collect()
+            for d in self.device_list:
+                torch.cuda.synchronize(d)
+                torch.cuda.empty_cache()
 
             # Get patch size from model for output expansion
             patch_size = self.dit_model.vid_in.patch_size  # (pt, ph, pw)
@@ -458,7 +523,7 @@ class PipelineDiTWrapper(torch.nn.Module):
             result = stitch_tiles_to_flat(
                 tile_outputs, tile_slices,
                 t_val, h_val, w_val, c_val,
-                self.spatial_config.overlap,
+                active_overlap,
                 patch_size,
                 device, dtype,
             )

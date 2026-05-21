@@ -662,6 +662,22 @@ def upscale_all_batches(
         # Initialize precision after DiT is materialized with actual weights
         ensure_precision_initialized(ctx, runner, debug)
 
+        # Wrap DiT with spatial tiling (non-FSDP mode) - AFTER materialization
+        # so block swap and other configs are already applied to the real model.
+        if ctx.get('spatial_tiling'):
+            from src.core.spatial_tiling import SpatialTilingDiTWrapper
+            st = ctx['spatial_tiling']
+            runner.dit = SpatialTilingDiTWrapper(
+                runner.dit,
+                device=torch.device(ctx['dit_device']),
+                debug=debug,
+                spatial_tile_size=st['tile_size'],
+                spatial_tile_overlap=st['overlap'],
+                auto_tile_size=st['auto_tile_size'],
+            )
+            debug.log("DiT wrapped with SpatialTilingDiTWrapper for spatial tiling",
+                      category="tiling", force=True)
+
         # Cache DiT now that it's fully configured and ready for inference
         if ctx['cache_context']['dit_cache'] and not ctx['cache_context']['cached_dit']:
             runner.dit._model_name = ctx['cache_context']['dit_model']

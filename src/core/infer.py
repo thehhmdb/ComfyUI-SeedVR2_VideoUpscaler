@@ -33,6 +33,15 @@ from ..optimization.performance import (
 from ..models.dit_3b import na
 
 
+def _get_vae_param_info(vae) -> Tuple[torch.device, torch.dtype]:
+    """Get VAE device and dtype from first parameter."""
+    try:
+        param = next(vae.parameters())
+        return param.device, param.dtype
+    except StopIteration:
+        return get_device(), torch.float32
+
+
 class VideoDiffusionInfer():
     def __init__(self, config: DictConfig, debug: 'Debug',
                  encode_tiled: bool = False, encode_tile_size: Tuple[int, int] = (512, 512), 
@@ -50,6 +59,11 @@ class VideoDiffusionInfer():
         self.decode_tile_size = decode_tile_size
         self.decode_tile_overlap = decode_tile_overlap
         self.tile_debug = tile_debug
+        # Cached VAE properties (populated on first vae_encode/vae_decode call)
+        self._vae_device = None
+        self._vae_dtype = None
+        self._vae_scale_tensor = None
+        self._vae_shift_tensor = None
         
     def get_condition(self, latent: Tensor, latent_blur: Tensor, task: str) -> Tensor:
         t, h, w, c = latent.shape
@@ -113,28 +127,44 @@ class VideoDiffusionInfer():
 
     # -------------------------------- Helper ------------------------------- #
 
+    def _ensure_vae_cache(self):
+        """Cache VAE device, dtype, and scale/shift tensors on first call."""
+        if self._vae_device is not None and self._vae_shift_tensor is not None:
+            return
+        device, vae_dtype = _get_vae_param_info(self.vae)
+        self._vae_device = device
+        self._vae_dtype = vae_dtype
+
+        dtype = getattr(torch, self.config.vae.dtype)
+        scale = self.config.vae.scaling_factor
+        shift = self.config.vae.get("shifting_factor", None)
+
+        # Handle OmegaConf returning None for missing keys
+        if scale is None:
+            scale = 1.0
+        if shift is None:
+            shift = 0.0
+
+        if isinstance(scale, ListConfig):
+            scale = torch.tensor(scale, device=device, dtype=dtype)
+        if isinstance(shift, ListConfig):
+            shift = torch.tensor(shift, device=device, dtype=dtype)
+
+        self._vae_scale_tensor = scale
+        self._vae_shift_tensor = shift
+
     @torch.no_grad()
     def vae_encode(self, samples: List[Tensor]) -> List[Tensor]:
         """VAE encode with configured dtype - converts samples to latents with optional tiling"""
         use_sample = self.config.vae.get("use_sample", True)
         latents = []
         if len(samples) > 0:
-            # Use VAE model's current device
-            # This ensures consistency with where the VAE model is loaded
-            try:
-                device = next(self.vae.parameters()).device
-            except StopIteration:
-                # Fallback if VAE has no parameters (shouldn't happen)
-                device = get_device()
-            
-            dtype = getattr(torch, self.config.vae.dtype)
-            scale = self.config.vae.scaling_factor
-            shift = self.config.vae.get("shifting_factor", 0.0)
-
-            if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
-            if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+            # Cache VAE device/dtype and scale/shift tensors (populated once)
+            self._ensure_vae_cache()
+            device = self._vae_device
+            vae_dtype = self._vae_dtype
+            scale = self._vae_scale_tensor if self._vae_scale_tensor is not None else self.config.vae.scaling_factor
+            shift = self._vae_shift_tensor if self._vae_shift_tensor is not None else 0.0
 
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
@@ -146,12 +176,6 @@ class VideoDiffusionInfer():
             for sample in batches:
                 if hasattr(self.vae, "preprocess"):
                     sample = self.vae.preprocess(sample)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from input dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)
@@ -184,8 +208,9 @@ class VideoDiffusionInfer():
                                             tile_overlap=self.encode_tile_overlap).posterior.mode().squeeze(2)
 
                 latent = latent.unsqueeze(2) if latent.ndim == 4 else latent
-                latent = optimized_channels_to_last(latent)
+                # Apply scale/shift before permute (arithmetic on contiguous view, then single permute)
                 latent = (latent - shift) * scale
+                latent = optimized_channels_to_last(latent)
                 latents.append(latent)
 
             # Ungroup back to individual latent with the original order.
@@ -204,22 +229,12 @@ class VideoDiffusionInfer():
         """VAE decode with configured dtype - converts latents to samples with optional tiling"""
         samples = []
         if len(latents) > 0:
-            # Use VAE model's current device
-            # This ensures consistency with where the VAE model is loaded
-            try:
-                device = next(self.vae.parameters()).device
-            except StopIteration:
-                # Fallback if VAE has no parameters (shouldn't happen)
-                device = get_device()
-            
-            dtype = getattr(torch, self.config.vae.dtype)
-            scale = self.config.vae.scaling_factor
-            shift = self.config.vae.get("shifting_factor", 0.0)
-
-            if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
-            if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+            # Cache VAE device/dtype and scale/shift tensors (populated once)
+            self._ensure_vae_cache()
+            device = self._vae_device
+            vae_dtype = self._vae_dtype
+            scale = self._vae_scale_tensor if self._vae_scale_tensor is not None else self.config.vae.scaling_factor
+            shift = self._vae_shift_tensor if self._vae_shift_tensor is not None else 0.0
 
             # Group samples of the same shape to batches if enabled.
             if self.config.vae.grouping:
@@ -233,12 +248,6 @@ class VideoDiffusionInfer():
                 latent = latent / scale + shift
                 latent = optimized_channels_to_second(latent)
                 latent = latent.squeeze(2)
-
-                # Detect VAE model dtype
-                try:
-                    vae_dtype = next(self.vae.parameters()).dtype
-                except StopIteration:
-                    vae_dtype = dtype  # Fallback
 
                 # Use autocast if VAE dtype differs from latent dtype
                 # Skip autocast on MPS (only supports bf16, unified memory = no benefit)

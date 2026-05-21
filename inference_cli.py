@@ -996,7 +996,18 @@ def _process_frames_core(
     ctx['cache_context'] = cache_context
     if runner_cache is not None:
         runner_cache['runner'] = runner
-    
+
+    # Store spatial tiling config for Phase 2 (applied after DiT materialization)
+    # In FSDP/pipeline mode, PipelineDiTWrapper handles tiling internally.
+    # In non-FSDP mode, upscale_all_batches wraps the DiT after materialization.
+    spatial_tiling_requested = args.spatial_tile_size > 0 or args.auto_tile_size
+    if spatial_tiling_requested:
+        ctx['spatial_tiling'] = {
+            'tile_size': args.spatial_tile_size,
+            'overlap': args.spatial_tile_overlap,
+            'auto_tile_size': args.auto_tile_size,
+        }
+
     # Preload text embeddings before Phase 1 to avoid sync stall in Phase 2
     ctx['text_embeds'] = load_text_embeddings(script_directory, ctx['dit_device'], ctx['compute_dtype'], debug)
     debug.log("Loaded text embeddings for DiT", category="dit")
@@ -1459,6 +1470,7 @@ def _process_frames_core_with_pipeline(
         runner.dit, device_list_torch, debug=debug,
         spatial_tile_size=args.spatial_tile_size,
         spatial_tile_overlap=args.spatial_tile_overlap,
+        auto_tile_size=args.auto_tile_size,
     )
     debug.log(f"DiT wrapped with PipelineDiTWrapper across {len(device_list_torch)} GPUs",
               category="pipeline", force=True)
@@ -1997,6 +2009,11 @@ Examples:
                              "Overlap region is blended between adjacent tiles to prevent visible seams. "
                              "Larger overlap = smoother blending but more compute. "
                              "Only used if --spatial_tile_size is set. Default: 32")
+    dit_tile_group.add_argument("--auto_tile_size", action="store_true",
+                        help="Auto-select spatial tile size per-batch based on available VRAM. "
+                             "Probes free VRAM before each batch and computes the largest tile size "
+                             "that fits. Disables tiling entirely if the full image fits. "
+                             "Ignored if --spatial_tile_size is explicitly set.")
     
     # Performance
     perf_group = parser.add_argument_group('Performance optimization')
