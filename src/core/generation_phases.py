@@ -24,6 +24,8 @@ Key Features:
 """
 
 import os
+import threading
+import copy
 import torch
 from typing import Dict, List, Optional, Tuple, Any, Callable
 
@@ -65,6 +67,382 @@ from ..utils.color_fix import (
     wavelet_reconstruction,
     adaptive_instance_normalization
 )
+from ..utils.debug import Debug
+
+
+def _parallel_vae_encode(
+    runner: 'VideoDiffusionInfer',
+    ctx: Dict[str, Any],
+    images: torch.Tensor,
+    device_list: List[str],
+    debug: 'Debug',
+    batch_size: int,
+    uniform_batch_size: bool,
+    seed: int,
+    temporal_overlap: int,
+    resolution: int,
+    max_resolution: int,
+    input_noise_scale: float,
+    color_correction: str,
+    batch_ranges: Optional[List[Tuple[int, int]]],
+) -> Dict[str, Any]:
+    """
+    Parallel VAE encoding across multiple GPUs.
+    
+    Splits input frames across GPUs, each GPU encodes its chunk independently,
+    then gathers latents. Falls back to sequential if VRAM is insufficient.
+    
+    Args:
+        runner: VideoDiffusionInfer instance
+        ctx: Generation context
+        images: Input frames [T, H, W, C]
+        device_list: List of GPU device IDs (e.g., ["0", "1"])
+        debug: Debug instance
+        batch_size, uniform_batch_size, seed, temporal_overlap, resolution, max_resolution,
+        input_noise_scale, color_correction, batch_ranges: Passed to encode_all_batches
+        
+    Returns:
+        Updated context with encoded latents
+    """
+    num_gpus = len(device_list)
+    total_frames = len(images)
+    
+    # Check available VRAM on each GPU
+    free_vrams = []
+    for d in device_list:
+        free, total = torch.cuda.mem_get_info(f"cuda:{d}")
+        free_vrams.append(free / (1024**3))  # GB
+    
+    min_free_gb = min(free_vrams)
+    
+    # VAE is ~1.5GB, plus activations. Need ~4GB per GPU for safe parallel encoding.
+    vram_per_gpu_threshold = 4.0
+    
+    if min_free_gb >= vram_per_gpu_threshold * num_gpus:
+        debug.log(f"Parallel VAE encoding: {num_gpus} GPUs, {min_free_gb:.1f}GB free per GPU",
+                  category="pipeline", force=True)
+        
+        # Determine per-GPU frame ranges
+        # If motion-adaptive batching is used, distribute batches across GPUs (respecting boundaries)
+        # Otherwise, split frames evenly
+        if batch_ranges is not None:
+            # Distribute motion-adaptive batches across GPUs
+            gpu_batch_ranges = [[] for _ in range(num_gpus)]
+            for i, (start, end) in enumerate(batch_ranges):
+                gpu_idx = i % num_gpus
+                gpu_batch_ranges[gpu_idx].append((start, end))
+            
+            # Compute frame chunks from batch ranges
+            frame_chunks = []
+            for i in range(num_gpus):
+                if gpu_batch_ranges[i]:
+                    chunk_start = gpu_batch_ranges[i][0][0]
+                    chunk_end = gpu_batch_ranges[i][-1][1]
+                    frame_chunks.append(chunk_end - chunk_start)
+                else:
+                    frame_chunks.append(0)
+            
+            # Prepare per-GPU data: images, local batch ranges, and chunk offsets
+            gpu_images = []
+            gpu_local_batch_ranges = []
+            gpu_chunk_offsets = []
+            for i in range(num_gpus):
+                if gpu_batch_ranges[i]:
+                    # Find the actual start frame (min of all batch starts)
+                    chunk_start = min(s for s, e in gpu_batch_ranges[i])
+                    chunk_end = max(e for s, e in gpu_batch_ranges[i])
+                    gpu_images.append(images[chunk_start:chunk_end].clone())
+                    # Convert to local indices (relative to chunk start)
+                    gpu_local_batch_ranges.append([(s - chunk_start, e - chunk_start) for s, e in gpu_batch_ranges[i]])
+                    gpu_chunk_offsets.append(chunk_start)
+                else:
+                    gpu_images.append(images[:1].clone())  # Dummy for empty GPU
+                    gpu_local_batch_ranges.append([])
+                    gpu_chunk_offsets.append(0)
+        else:
+            # Split frames evenly
+            frames_per_gpu = total_frames // num_gpus
+            frame_chunks = []
+            remaining = total_frames
+            for i in range(num_gpus):
+                if i == num_gpus - 1:
+                    chunk_size = remaining
+                else:
+                    chunk_size = frames_per_gpu
+                frame_chunks.append(chunk_size)
+                remaining -= chunk_size
+            
+            # Prepare per-GPU data: images, start indices
+            gpu_images = []
+            for i, chunk_size in enumerate(frame_chunks):
+                start = sum(frame_chunks[:i])
+                end = start + chunk_size
+                gpu_images.append(images[start:end].clone())
+            
+            gpu_local_batch_ranges = [None] * num_gpus
+            gpu_chunk_offsets = [sum(frame_chunks[:i]) for i in range(num_gpus)]
+        
+        # Compute video transform once in main thread (avoids race conditions)
+        sample_frame = images[0].permute(2, 0, 1).unsqueeze(0)
+        true_h, true_w, padded_h, padded_w = setup_video_transform(ctx, resolution, max_resolution, debug, sample_frame)
+        del sample_frame
+        
+        # Shared results with lock for thread-safe appending
+        all_latents = []
+        all_ori_lengths = []
+        all_batch_metadata = []
+        result_lock = threading.Lock()
+        
+        def encode_chunk(gpu_idx, chunk_images, chunk_size, chunk_batch_ranges, chunk_offset):
+            """Encode a chunk on assigned GPU using a deep copy of VAE."""
+            gpu_device = torch.device(f"cuda:{device_list[gpu_idx]}")
+            
+            # Deep copy VAE to isolate InflatedCausalConv3d memory state between threads,
+            # then move to target GPU
+            vae_copy = copy.deepcopy(runner.vae).to(gpu_device)
+            
+            # Setup context for this chunk (deep copy transform to avoid race conditions)
+            chunk_ctx = dict(ctx)
+            chunk_ctx['vae_device'] = gpu_device
+            chunk_ctx['total_frames'] = len(chunk_images)
+            chunk_ctx['all_latents'] = []
+            chunk_ctx['all_ori_lengths'] = []
+            chunk_ctx['video_transform'] = copy.deepcopy(ctx['video_transform'])
+            chunk_ctx['true_target_dims'] = (true_h, true_w)
+            
+            # Create a minimal runner with this GPU's VAE
+            chunk_runner = VideoDiffusionInfer(
+                config=runner.config,
+                debug=runner.debug,
+                encode_tiled=runner.encode_tiled,
+                encode_tile_size=runner.encode_tile_size,
+                encode_tile_overlap=runner.encode_tile_overlap,
+                decode_tiled=runner.decode_tiled,
+                decode_tile_size=runner.decode_tile_size,
+                decode_tile_overlap=runner.decode_tile_overlap,
+                tile_debug=runner.tile_debug
+            )
+            chunk_runner.vae = vae_copy
+            chunk_runner.dit = None  # No DiT needed for VAE-only encoding
+            
+            # Encode this chunk (pass motion-adaptive batch ranges if available)
+            chunk_ctx = encode_all_batches(
+                chunk_runner, ctx=chunk_ctx, images=chunk_images,
+                debug=debug,
+                batch_size=batch_size,
+                uniform_batch_size=uniform_batch_size,
+                seed=seed,
+                progress_callback=None,
+                temporal_overlap=0,  # No overlap between GPU chunks
+                resolution=resolution,
+                max_resolution=max_resolution,
+                input_noise_scale=input_noise_scale,
+                color_correction=color_correction,
+                batch_ranges=chunk_batch_ranges,
+            )
+            
+            # Thread-safe result collection
+            with result_lock:
+                all_latents.extend(chunk_ctx['all_latents'])
+                all_ori_lengths.extend(chunk_ctx['all_ori_lengths'])
+                if color_correction != "none" and chunk_ctx.get('batch_metadata'):
+                    # Offset batch_metadata indices to original frame positions
+                    for entry in chunk_ctx['batch_metadata']:
+                        if entry is not None:
+                            s, e, p = entry
+                            all_batch_metadata.append((s + chunk_offset, e + chunk_offset, p))
+                        else:
+                            all_batch_metadata.append(None)
+            
+            # Cleanup GPU memory
+            torch.cuda.empty_cache()
+        
+        # Launch GPU threads in parallel (skip GPUs with no assigned batches)
+        threads = []
+        for i in range(num_gpus):
+            if gpu_local_batch_ranges[i]:  # Skip empty GPUs
+                t = threading.Thread(target=encode_chunk, args=(i, gpu_images[i], frame_chunks[i], gpu_local_batch_ranges[i], gpu_chunk_offsets[i]))
+                t.start()
+                threads.append(t)
+        
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
+        
+        ctx['all_latents'] = all_latents
+        ctx['all_ori_lengths'] = all_ori_lengths
+        
+        # Store input_images for Phase 4 color correction reconstruction
+        if ctx['vae_device'].type == 'mps' and images.device.type != 'mps':
+            ctx['input_images'] = images.to(ctx['vae_device'])
+        else:
+            ctx['input_images'] = images
+        
+        # Store batch_metadata with proper tuple format (start_idx, end_idx, uniform_padding)
+        if color_correction != "none":
+            ctx['batch_metadata'] = all_batch_metadata
+        
+        return ctx
+    else:
+        debug.log(f"Parallel VAE encoding: falling back to sequential (only {min_free_gb:.1f}GB free per GPU)",
+                  category="pipeline", force=True)
+        return ctx
+
+
+def _parallel_vae_decode(
+    runner: 'VideoDiffusionInfer',
+    ctx: Dict[str, Any],
+    device_list: List[str],
+    debug: 'Debug',
+    cache_model: bool,
+) -> Dict[str, Any]:
+    """
+    Parallel VAE decoding across multiple GPUs.
+    
+    Splits upscaled latents across GPUs, each GPU decodes its chunk independently,
+    then writes to pre-allocated final_video. Falls back to sequential if VRAM is insufficient.
+    
+    Args:
+        runner: VideoDiffusionInfer instance
+        ctx: Generation context with all_upscaled_latents
+        device_list: List of GPU device IDs
+        debug: Debug instance
+        cache_model: Whether to cache VAE after decoding
+        
+    Returns:
+        Updated context with decoded final_video
+    """
+    num_gpus = len(device_list)
+    
+    # Count valid latents
+    valid_latents = [l for l in ctx['all_upscaled_latents'] if l is not None]
+    num_valid = len(valid_latents)
+    
+    if num_valid == 0:
+        return ctx
+    
+    # Check available VRAM on each GPU
+    free_vrams = []
+    for d in device_list:
+        free, total = torch.cuda.mem_get_info(f"cuda:{d}")
+        free_vrams.append(free / (1024**3))  # GB
+    
+    min_free_gb = min(free_vrams)
+    
+    # VAE is ~1.5GB, plus activations. Need ~4GB per GPU for safe parallel decoding.
+    vram_per_gpu_threshold = 4.0
+    
+    if min_free_gb >= vram_per_gpu_threshold * num_gpus:
+        debug.log(f"Parallel VAE decoding: {num_gpus} GPUs, {min_free_gb:.1f}GB free per GPU",
+                  category="pipeline", force=True)
+        
+        # Split latents across GPUs
+        latents_per_gpu = num_valid // num_gpus
+        latent_chunks = []
+        remaining = num_valid
+        for i in range(num_gpus):
+            if i == num_gpus - 1:
+                chunk_size = remaining
+            else:
+                chunk_size = latents_per_gpu
+            latent_chunks.append(chunk_size)
+            remaining -= chunk_size
+        
+        # Get output dimensions
+        true_h, true_w = ctx['true_target_dims']
+        total_frames = ctx.get('total_frames', 0)
+        C = 4 if ctx.get('is_rgba', False) else 3
+        
+        # Pre-allocate final_video on CPU (thread-safe: each thread writes to its own slice)
+        target_device = ctx.get('tensor_offload_device') or 'cpu'
+        ctx['final_video'] = torch.empty((total_frames, true_h, true_w, C), 
+                                          dtype=ctx['compute_dtype'], device=target_device)
+        
+        # Shared decode_batch_info with lock
+        decode_batch_info = []
+        result_lock = threading.Lock()
+        
+        def decode_chunk(gpu_idx, chunk_latents, write_offset, chunk_ori_lengths, chunk_total_frames):
+            """Decode a chunk on assigned GPU using a deep copy of VAE."""
+            gpu_device = torch.device(f"cuda:{device_list[gpu_idx]}")
+            
+            # Deep copy VAE to isolate InflatedCausalConv3d memory state between threads,
+            # then move to target GPU
+            vae_copy = copy.deepcopy(runner.vae).to(gpu_device)
+            
+            # Setup context for this chunk
+            chunk_ctx = dict(ctx)
+            chunk_ctx['vae_device'] = gpu_device
+            chunk_ctx['all_upscaled_latents'] = chunk_latents
+            chunk_ctx['all_ori_lengths'] = chunk_ori_lengths
+            chunk_ctx['total_frames'] = chunk_total_frames
+            chunk_ctx['final_video'] = torch.empty((chunk_total_frames, true_h, true_w, C),
+                                                    dtype=ctx['compute_dtype'], device=target_device)
+            chunk_ctx['decode_batch_info'] = []
+            chunk_ctx['tensor_offload_device'] = target_device
+            
+            # Create a minimal runner with this GPU's VAE
+            chunk_runner = VideoDiffusionInfer(
+                config=runner.config,
+                debug=runner.debug,
+                encode_tiled=runner.encode_tiled,
+                encode_tile_size=runner.encode_tile_size,
+                encode_tile_overlap=runner.encode_tile_overlap,
+                decode_tiled=runner.decode_tiled,
+                decode_tile_size=runner.decode_tile_size,
+                decode_tile_overlap=runner.decode_tile_overlap,
+                tile_debug=runner.tile_debug
+            )
+            chunk_runner.vae = vae_copy
+            chunk_runner.dit = None  # No DiT needed for VAE-only decoding
+            
+            # Decode this chunk
+            chunk_ctx = decode_all_batches(
+                chunk_runner, ctx=chunk_ctx, debug=debug,
+                progress_callback=None, cache_model=False,
+            )
+            
+            # Write to main final_video (each thread writes to its own slice, no lock needed)
+            chunk_result = chunk_ctx['final_video']
+            ctx['final_video'][write_offset:write_offset + len(chunk_result)] = chunk_result
+            
+            # Adjust decode_batch_info write positions
+            with result_lock:
+                for write_s, write_e, batch_i, ori_len in chunk_ctx['decode_batch_info']:
+                    decode_batch_info.append((write_s + write_offset, write_e + write_offset, 
+                                              batch_i + write_offset, ori_len))
+            
+            # Cleanup GPU memory
+            torch.cuda.empty_cache()
+        
+        # Launch GPU threads in parallel (skip GPUs with no assigned latents)
+        threads = []
+        latent_offset = 0
+        write_offset = 0
+        for i, chunk_size in enumerate(latent_chunks):
+            if chunk_size > 0:  # Skip empty GPUs
+                chunk_latents = [valid_latents[j] for j in range(latent_offset, latent_offset + chunk_size)]
+                chunk_ori_lengths = [ctx['all_ori_lengths'][j] for j in range(latent_offset, latent_offset + chunk_size)]
+                chunk_total_frames = sum(chunk_ori_lengths)
+                
+                t = threading.Thread(target=decode_chunk, args=(i, chunk_latents, write_offset, chunk_ori_lengths, chunk_total_frames))
+                t.start()
+                threads.append(t)
+                
+                latent_offset += chunk_size
+                write_offset += chunk_total_frames
+        
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
+        
+        ctx['decode_batch_info'] = decode_batch_info
+        
+        return ctx
+    else:
+        debug.log(f"Parallel VAE decoding: falling back to sequential (only {min_free_gb:.1f}GB free per GPU)",
+                  category="pipeline", force=True)
+        return ctx
 
 
 def _prepare_video_batch(

@@ -217,6 +217,10 @@ class SpatialTilingDiTWrapper(torch.nn.Module):
         tile_outputs = []
         tile_slices = []
 
+        # Per-tile cleanup: free intermediates after each tile to prevent VRAM accumulation
+        # Empty cache every N tiles to reclaim fragmented memory
+        _empty_cache_interval = max(4, len(tile_grid) // 4) if len(tile_grid) > 4 else 4
+
         for i, (h_slice, w_slice) in enumerate(tile_grid):
             tile_vid, tile_vid_shape = extract_tile_from_flat(
                 vid, vid_shape, h_slice, w_slice,
@@ -237,17 +241,21 @@ class SpatialTilingDiTWrapper(torch.nn.Module):
             tile_outputs.append(tile_out)
             tile_slices.append((h_slice, w_slice))
 
+            # Free tile intermediates immediately after each tile
             del tile_vid, tile_vid_shape, tile_out
+
+            # Periodic cache cleanup to prevent VRAM fragmentation
+            if (i + 1) % _empty_cache_interval == 0 or (i + 1) == len(tile_grid):
+                torch.cuda.empty_cache()
 
             if self.debug:
                 self.debug.log(f"  Tile {i + 1}/{len(tile_grid)} complete",
                               category="tiling", force=True)
 
-        # Single VRAM cleanup after all tiles processed
+        # Final cleanup after all tiles processed
         import gc
         gc.collect()
         torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
 
         patch_size = self.dit_model.vid_in.patch_size  # (pt, ph, pw)
 

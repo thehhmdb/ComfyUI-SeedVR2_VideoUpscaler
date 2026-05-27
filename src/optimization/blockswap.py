@@ -384,20 +384,20 @@ def _configure_blocks(
         if has_meta:
             block.to_empty(device=target_device, recurse=True)
         else:
-            block.to(target_device, non_blocking=False)
+            block.to(target_device, non_blocking=True)
 
         total_offload_memory += block_memory if b <= model.blocks_to_swap else 0
         total_main_memory += block_memory if b > model.blocks_to_swap else 0
 
-    # Ensure all buffers match their containing module's device
-    for b, block in enumerate(model.blocks):
-        target_device = device if b > model.blocks_to_swap else offload_device
-        for name, buffer in block.named_buffers():
-            if buffer.device.type == 'meta':
-                buffer.data = torch.empty_like(buffer.data, device=target_device)
-            elif buffer.device != torch.device(target_device):
-                buffer.data = buffer.data.to(target_device, non_blocking=False)
-
+        # Ensure all buffers match their containing module's device
+        for b, block in enumerate(model.blocks):
+            target_device = device if b > model.blocks_to_swap else offload_device
+            for name, buffer in block.named_buffers():
+                if buffer.device.type == 'meta':
+                    buffer.data = torch.empty_like(buffer.data, device=target_device)
+                elif buffer.device != torch.device(target_device):
+                    buffer.data = buffer.data.to(target_device, non_blocking=True)
+    
     return {
         "offload_memory": total_offload_memory,
         "main_memory": total_main_memory,
@@ -515,15 +515,15 @@ def _wrap_block_forward(
             # Only move to GPU if necessary
             current_device = next(self.parameters()).device
             target_device = torch.device(model.main_device)
-            
+
             if current_device != target_device:
-                self.to(model.main_device, non_blocking=False)
+                self.to(model.main_device, non_blocking=True)
 
             # Execute forward pass with OOM protection
             output = original_forward(*args, **kwargs)
 
-            # Move back to offload device
-            self.to(model.offload_device, non_blocking=False)
+            # Move back to offload device (non-blocking to overlap with next block's compute)
+            self.to(model.offload_device, non_blocking=True)
             
             # Use dynamo-disabled helper to log timing (avoids compilation warnings)
             _log_swap_timing(debug, t_start, self._block_idx, "block")
@@ -593,16 +593,16 @@ def _wrap_io_forward(
         # Check current device to avoid unnecessary moves
         current_device = next(self.parameters()).device
         target_device = torch.device(model.main_device)
-        
-        # Move to GPU for computation if needed
+
+        # Move to GPU for computation if needed (non-blocking to overlap with compute)
         if current_device != target_device:
-            self.to(model.main_device, non_blocking=False)
+            self.to(model.main_device, non_blocking=True)
 
         # Execute forward pass
         output = self._original_forward(*args, **kwargs)
 
-        # Move back to offload device
-        self.to(model.offload_device, non_blocking=False)
+        # Move back to offload device (non-blocking to overlap with next I/O's compute)
+        self.to(model.offload_device, non_blocking=True)
         
         # Use dynamo-disabled helper to log timing (avoids compilation warnings)
         _log_swap_timing(debug, t_start, self._module_name, "I/O")

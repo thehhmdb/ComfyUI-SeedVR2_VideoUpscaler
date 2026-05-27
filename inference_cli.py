@@ -1276,7 +1276,8 @@ def _process_frames_core_with_pipeline(
     from src.core.model_configuration import configure_runner
     from src.core.model_loader import materialize_model
     from src.core.generation_phases import (
-        encode_all_batches, upscale_all_batches, decode_all_batches, postprocess_all_batches
+        encode_all_batches, upscale_all_batches, decode_all_batches, postprocess_all_batches,
+        _parallel_vae_encode, _parallel_vae_decode
     )
     from src.core.generation_utils import (
         compute_generation_info, log_generation_start, load_text_embeddings, script_directory
@@ -1428,7 +1429,7 @@ def _process_frames_core_with_pipeline(
                   f"avg={sum(batch_sizes)/len(batch_sizes):.1f}, total={sum(batch_sizes)}",
                   category="motion", force=True)
 
-    # === Phase 1: VAE Encode on GPU 0 ===
+    # === Phase 1: VAE Encode ===
     materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
 
     # Temporarily remove DiT reference during VAE encoding to prevent
@@ -1436,20 +1437,53 @@ def _process_frames_core_with_pipeline(
     dit_model_backup = runner.dit
     runner.dit = None
 
-    ctx = encode_all_batches(
-        runner, ctx=ctx, images=frames_tensor,
-        debug=debug,
-        batch_size=pipeline_batch_size,
-        uniform_batch_size=args.uniform_batch_size,
-        seed=args.seed,
-        progress_callback=None,
-        temporal_overlap=args.temporal_overlap,
-        resolution=args.resolution,
-        max_resolution=args.max_resolution,
-        input_noise_scale=args.input_noise_scale,
-        color_correction=args.color_correction,
-        batch_ranges=batch_ranges,
-    )
+    # Try parallel encoding across multiple GPUs (with automatic VRAM-based fallback)
+    if num_gpus > 1:
+        ctx = _parallel_vae_encode(
+            runner, ctx=ctx, images=frames_tensor,
+            device_list=device_list, debug=debug,
+            batch_size=pipeline_batch_size,
+            uniform_batch_size=args.uniform_batch_size,
+            seed=args.seed,
+            temporal_overlap=args.temporal_overlap,
+            resolution=args.resolution,
+            max_resolution=args.max_resolution,
+            input_noise_scale=args.input_noise_scale,
+            color_correction=args.color_correction,
+            batch_ranges=batch_ranges,
+        )
+        if not ctx.get('all_latents') or len(ctx['all_latents']) == 0:
+            debug.log("Parallel encode not used (low VRAM), falling back to sequential",
+                      category="pipeline", force=True)
+            ctx = encode_all_batches(
+                runner, ctx=ctx, images=frames_tensor,
+                debug=debug,
+                batch_size=pipeline_batch_size,
+                uniform_batch_size=args.uniform_batch_size,
+                seed=args.seed,
+                progress_callback=None,
+                temporal_overlap=args.temporal_overlap,
+                resolution=args.resolution,
+                max_resolution=args.max_resolution,
+                input_noise_scale=args.input_noise_scale,
+                color_correction=args.color_correction,
+                batch_ranges=batch_ranges,
+            )
+    else:
+        ctx = encode_all_batches(
+            runner, ctx=ctx, images=frames_tensor,
+            debug=debug,
+            batch_size=pipeline_batch_size,
+            uniform_batch_size=args.uniform_batch_size,
+            seed=args.seed,
+            progress_callback=None,
+            temporal_overlap=args.temporal_overlap,
+            resolution=args.resolution,
+            max_resolution=args.max_resolution,
+            input_noise_scale=args.input_noise_scale,
+            color_correction=args.color_correction,
+            batch_ranges=batch_ranges,
+        )
 
     # Restore DiT reference after VAE encoding completes
     runner.dit = dit_model_backup
@@ -1486,13 +1520,27 @@ def _process_frames_core_with_pipeline(
     torch.cuda.empty_cache()
     debug.log("DiT cleaned up by upscale_all_batches, clearing cache before VAE decode", category="pipeline", force=True)
 
-    # === Phase 3: VAE Decode (move VAE back to GPU) ===
+    # === Phase 3: VAE Decode ===
     runner.vae = runner.vae.to(ctx['vae_device'])
 
-    ctx = decode_all_batches(
-        runner, ctx=ctx, debug=debug, progress_callback=None,
-        cache_model=False,
-    )
+    # Try parallel decoding across multiple GPUs (with automatic VRAM-based fallback)
+    if num_gpus > 1:
+        ctx = _parallel_vae_decode(
+            runner, ctx=ctx, device_list=device_list,
+            debug=debug, cache_model=False,
+        )
+        if ctx.get('final_video') is None or ctx['final_video'].numel() == 0:
+            debug.log("Parallel decode not used (low VRAM), falling back to sequential",
+                      category="pipeline", force=True)
+            ctx = decode_all_batches(
+                runner, ctx=ctx, debug=debug, progress_callback=None,
+                cache_model=False,
+            )
+    else:
+        ctx = decode_all_batches(
+            runner, ctx=ctx, debug=debug, progress_callback=None,
+            cache_model=False,
+        )
 
     # === Phase 4: Post-process ===
     # Aggressively clean up all GPU memory before post-processing to avoid OOM.

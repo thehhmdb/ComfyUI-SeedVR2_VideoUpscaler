@@ -184,6 +184,47 @@ def wavelet_decomposition(image: Tensor, levels: int = 5) -> tuple[Tensor, Tenso
     return high_freq, low_freq
 
 
+# Compiled versions for performance (lazy-initialized on first use)
+_compiled_wavelet_decomposition = None
+_compiled_wavelet_reconstruction = None
+_compiled_lab_color_transfer = None
+
+
+def _get_compiled_wavelet_decomposition():
+    global _compiled_wavelet_decomposition
+    if _compiled_wavelet_decomposition is None:
+        _compiled_wavelet_decomposition = torch.compile(
+            wavelet_decomposition, mode="reduce-overhead", dynamic=True
+        )
+    return _compiled_wavelet_decomposition
+
+
+def _get_compiled_wavelet_reconstruction():
+    global _compiled_wavelet_reconstruction
+    if _compiled_wavelet_reconstruction is None:
+        _compiled_wavelet_reconstruction = torch.compile(
+            wavelet_reconstruction, mode="reduce-overhead", dynamic=True
+        )
+    return _compiled_wavelet_reconstruction
+
+
+def _get_compiled_lab_color_transfer():
+    global _compiled_lab_color_transfer
+    if _compiled_lab_color_transfer is None:
+        _compiled_lab_color_transfer = torch.compile(
+            lab_color_transfer, mode="reduce-overhead", dynamic=True
+        )
+    return _compiled_lab_color_transfer
+
+
+def reset_compiled_color_functions():
+    """Reset compiled color correction functions (useful for device changes)."""
+    global _compiled_wavelet_decomposition, _compiled_wavelet_reconstruction, _compiled_lab_color_transfer
+    _compiled_wavelet_decomposition = None
+    _compiled_wavelet_reconstruction = None
+    _compiled_lab_color_transfer = None
+
+
 def wavelet_reconstruction(content_feat: Tensor, style_feat: Tensor, debug: Optional['Debug'] = None) -> Tensor:
     """
     Apply wavelet-based color transfer from style to content.

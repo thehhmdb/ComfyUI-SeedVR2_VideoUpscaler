@@ -27,41 +27,80 @@ from torch import nn
 def pytorch_varlen_attention(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.0, softmax_scale=None, causal=False, deterministic=False):
     """
     A PyTorch-based implementation of variable-length attention to replace flash_attn_varlen_func.
-    It processes each sequence in the batch individually.
+    Uses a single batched SDPA call with masking for optimal performance.
     
     NOTE: max_seqlen_q and max_seqlen_k are accepted for API compatibility but not used.
     PyTorch's scaled_dot_product_attention automatically handles variable sequence lengths.
     
-    COMPILE OPTIMIZATION: Uses torch.tensor_split to avoid .item() graph breaks
+    COMPILE OPTIMIZATION: Uses torch.tensor_split to avoid .item() graph breaks.
+    Uses batched SDPA with masking instead of per-sequence Python loop.
     """
-    # Split q, k, v using cumulative sequence lengths
-    # NOTE: torch.tensor_split requires int64 dtype and CPU device (PyTorch requirements)
-    q_splits = list(torch.tensor_split(q, cu_seqlens_q[1:-1].long().cpu(), dim=0))
-    k_splits = list(torch.tensor_split(k, cu_seqlens_k[1:-1].long().cpu(), dim=0))
-    v_splits = list(torch.tensor_split(v, cu_seqlens_k[1:-1].long().cpu(), dim=0))
-
-    # Process each sequence
-    output_splits = []
-    for q_i, k_i, v_i in zip(q_splits, k_splits, v_splits):
-        # Reshape for torch's scaled_dot_product_attention which expects (batch, heads, seq, dim).
-        # Here, we treat each sequence as a batch of 1.
-        q_i = q_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_q, head_dim)
-        k_i = k_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
-        v_i = v_i.permute(1, 0, 2).unsqueeze(0) # (1, heads, seq_len_k, head_dim)
-
-        # Use PyTorch's built-in scaled dot-product attention.
-        output_i = F.scaled_dot_product_attention(
-            q_i, k_i, v_i, 
+    # Get sequence lengths from cumulative lengths
+    # Avoid .cpu() call to prevent GPU sync — use .long() on-device instead
+    cu_q = cu_seqlens_q.long()
+    cu_k = cu_seqlens_k.long()
+    seqlens_q = cu_q[1:] - cu_q[:-1]  # per-sequence lengths
+    seqlens_k = cu_k[1:] - cu_k[:-1]
+    
+    num_seqs = len(seqlens_q)
+    
+    # Fast path: all sequences same length → single batched call, no masking needed
+    if num_seqs > 0 and (seqlens_q[0] == seqlens_q).all() and (seqlens_k[0] == seqlens_k).all():
+        sq = seqlens_q[0].item()
+        sk = seqlens_k[0].item()
+        # Reshape: (total_seq, heads, head_dim) -> (num_seqs, heads, max_seq, head_dim)
+        q_b = q[:num_seqs * sq].reshape(num_seqs, -1, sq, q.shape[-1])  # (num_seqs, heads, sq, head_dim)
+        k_b = k[:num_seqs * sk].reshape(num_seqs, -1, sk, k.shape[-1])
+        v_b = v[:num_seqs * sk].reshape(num_seqs, -1, sk, v.shape[-1])
+        
+        output_b = F.scaled_dot_product_attention(
+            q_b, k_b, v_b,
             dropout_p=dropout_p if not deterministic else 0.0,
             is_causal=causal
         )
-
-        # Reshape the output back to the original format (seq_len, heads, head_dim)
-        output_i = output_i.squeeze(0).permute(1, 0, 2)
-        output_splits.append(output_i)
+        # Reshape back: (num_seqs, heads, sq, head_dim) -> (total_seq, heads, head_dim)
+        return output_b.reshape(-1, sq, q.shape[-1])
     
-    # Concatenate all outputs
-    return torch.cat(output_splits, dim=0)
+    # General path: variable lengths — use batched SDPA with attention mask
+    max_sq = seqlens_q.max().item()
+    max_sk = seqlens_k.max().item()
+    
+    # Allocate padded tensors
+    q_padded = q.new_empty(num_seqs, q.shape[-2], max_sq, q.shape[-1])
+    k_padded = k.new_empty(num_seqs, k.shape[-2], max_sk, k.shape[-1])
+    v_padded = v.new_empty(num_seqs, v.shape[-2], max_sk, v.shape[-1])
+    
+    # Fill padded tensors
+    for i in range(num_seqs):
+        sq_i = seqlens_q[i].item()
+        sk_i = seqlens_k[i].item()
+        q_padded[i, :, :sq_i] = q[cu_q[i]:cu_q[i+1]]
+        k_padded[i, :, :sk_i] = k[cu_k[i]:cu_k[i+1]]
+        v_padded[i, :, :sk_i] = v[cu_k[i]:cu_k[i+1]]
+    
+    # Build attention mask: (num_seqs, 1, max_sq, max_sk)
+    # True = valid, False = ignored
+    mask = torch.ones(num_seqs, 1, max_sq, max_sk, dtype=q.dtype, device=q.device)
+    for i in range(num_seqs):
+        sq_i = seqlens_q[i].item()
+        sk_i = seqlens_k[i].item()
+        mask[i, :, sq_i:, :] = float('-inf')  # Mask query positions beyond seq length
+        mask[i, :, :sq_i, sk_i:] = float('-inf')  # Mask key positions beyond seq length
+    
+    output_b = F.scaled_dot_product_attention(
+        q_padded, k_padded, v_padded,
+        attn_mask=mask,
+        dropout_p=dropout_p if not deterministic else 0.0,
+        is_causal=causal
+    )
+    
+    # Extract outputs in original order
+    output = torch.cat([
+        output_b[i, :, :seqlens_q[i].item()]
+        for i in range(num_seqs)
+    ], dim=1)
+    
+    return output
 
 
 class TorchAttention(nn.Module):

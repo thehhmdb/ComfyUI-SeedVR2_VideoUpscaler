@@ -502,14 +502,18 @@ class PipelineDiTWrapper(torch.nn.Module):
                 # Free intermediate tile tensors (lightweight - just Python ref drops)
                 del tile_vid, tile_vid_shape, tile_out
 
+                # Per-tile cache cleanup: free VRAM every N tiles to prevent accumulation
+                # across GPUs during tiling loop
+                _interval = max(4, len(tile_grid) // 4) if len(tile_grid) > 4 else 4
+                if (i + 1) % _interval == 0 or (i + 1) == len(tile_grid):
+                    for d in self.device_list:
+                        torch.cuda.empty_cache()
+
                 if self.debug:
                     self.debug.log(f"  Tile {i + 1}/{len(tile_grid)} complete",
                                   category="tiling", force=True)
 
-            # Single VRAM cleanup after all tiles processed (not per-tile).
-            # Per-tile gc.collect() + synchronize was the dominant CPU overhead
-            # in the tiling loop. The del statements above already release refs;
-            # one final cleanup is sufficient before stitching.
+            # Final cleanup after all tiles processed
             import gc
             gc.collect()
             for d in self.device_list:

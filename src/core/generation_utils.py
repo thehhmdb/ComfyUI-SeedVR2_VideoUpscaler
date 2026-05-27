@@ -29,6 +29,7 @@ These utilities support the 4-phase pipeline implemented in generation_phases.py
 
 import os
 import torch
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple, Any, Callable, Union
 from torchvision.transforms import Compose, Lambda, Normalize
 
@@ -43,6 +44,51 @@ from ..utils.constants import get_script_directory
 
 # Get script directory for embeddings
 script_directory = get_script_directory()
+
+
+@lru_cache(maxsize=32)
+def _get_hann_window_1d(overlap: int, dtype_str: str, device_str: str) -> torch.Tensor:
+    """
+    Cached Hann window weights for blend_overlapping_frames.
+    
+    Keyed by (overlap, dtype, device) to avoid re-allocating weight tensors
+    on every blend call. Weights are small (~overlap floats) and reused
+    across all overlap operations with the same parameters.
+    
+    Args:
+        overlap: Number of overlapping frames
+        dtype_str: String representation of dtype (e.g., "torch.float32")
+        device_str: String representation of device (e.g., "cuda:0")
+        
+    Returns:
+        1D tensor of Hann window weights [overlap]
+    """
+    dtype = getattr(torch, dtype_str.replace("torch.", ""))
+    device = torch.device(device_str)
+    
+    if overlap >= 3:
+        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
+        blend_start = 1.0 / 3.0
+        blend_end = 2.0 / 3.0
+        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
+        w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)
+    else:
+        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
+    
+    return w_prev_1d
+
+
+def _get_hann_window(overlap: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    Get cached Hann window weights reshaped for broadcasting.
+    
+    Returns:
+        4D tensor [overlap, 1, 1, 1] ready for broadcasting with frame tensors
+    """
+    w_prev_1d = _get_hann_window_1d(
+        overlap, str(dtype).replace("torch.", ""), str(device)
+    )
+    return w_prev_1d.view(overlap, 1, 1, 1)
 
 
 def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Optional['Debug'] = None) -> Compose:
@@ -297,17 +343,8 @@ def blend_overlapping_frames(prev_tail: torch.Tensor, cur_head: torch.Tensor, ov
     device = prev_tail.device
     dtype = prev_tail.dtype
     
-    # Smooth crossfade with Hann window for overlap >= 3, linear for smaller overlaps
-    if overlap >= 3:
-        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=dtype)
-        blend_start = 1.0 / 3.0
-        blend_end = 2.0 / 3.0
-        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
-        w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)  # Hann window
-    else:
-        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=dtype)
-    
-    w_prev = w_prev_1d.view(overlap, 1, 1, 1)
+    # Use cached Hann window weights (avoids re-allocation per call)
+    w_prev = _get_hann_window(overlap, device, dtype)
     w_cur = 1.0 - w_prev
     
     return prev_tail * w_prev + cur_head * w_cur
@@ -360,15 +397,10 @@ def motion_aware_blend(
     device = prev_tail.device
     dtype = prev_tail.dtype
 
-    # Base Hann window weights (same as standard blending)
-    if overlap >= 3:
-        t = torch.linspace(0.0, 1.0, steps=overlap, device=device, dtype=torch.float32)
-        blend_start = 1.0 / 3.0
-        blend_end = 2.0 / 3.0
-        u = ((t - blend_start) / (blend_end - blend_start)).clamp(0.0, 1.0)
-        w_prev_1d = 0.5 + 0.5 * torch.cos(torch.pi * u)  # Hann window
-    else:
-        w_prev_1d = torch.linspace(1.0, 0.0, steps=overlap, device=device, dtype=torch.float32)
+    # Base Hann window weights (same as standard blending, cached)
+    w_prev_1d = _get_hann_window_1d(
+        overlap, "torch.float32", str(device)
+    )
 
     # Check for scene cuts first (global fallback)
     has_scene_cut = False

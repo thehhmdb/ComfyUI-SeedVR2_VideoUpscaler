@@ -42,6 +42,54 @@ def _get_vae_param_info(vae) -> Tuple[torch.device, torch.dtype]:
         return get_device(), torch.float32
 
 
+def _compute_optimal_vae_tile_size(tile_size: Tuple[int, int], frames: int, 
+                                    free_bytes: int, vae_dtype_bytes: int = 4) -> Tuple[int, int]:
+    """
+    Compute optimal VAE tile size based on available VRAM.
+    
+    VAE processes tiles with activation memory ~ O(frames * tile_h * tile_w * channels * dtype_size).
+    We estimate the memory footprint and reduce tile size if needed to stay within budget.
+    
+    Args:
+        tile_size: Current tile size (height, width)
+        frames: Number of frames in the video
+        free_bytes: Free VRAM in bytes
+        vae_dtype_bytes: Bytes per VAE element (4 for float32, 2 for float16/bfloat16)
+        
+    Returns:
+        Optimal tile size (height, width) that fits in available VRAM
+    """
+    if not tile_size:
+        return tile_size
+    
+    tile_h, tile_w = tile_size
+    
+    # Estimate memory per tile (activations + intermediate features)
+    # VAE typically has ~8x feature map expansion during encode/decode
+    # Plus activation overhead for convolutions
+    estimated_bytes_per_pixel = vae_dtype_bytes * 16  # Conservative estimate
+    tile_memory = frames * tile_h * tile_w * estimated_bytes_per_pixel
+    
+    # Safety margin: only use 60% of estimated free memory
+    safety_margin = 0.6
+    budget = free_bytes * safety_margin
+    
+    # Scale down tile size if needed (maintain aspect ratio)
+    scale = 1.0
+    if tile_memory > budget:
+        scale = (budget / tile_memory) ** 0.5
+        tile_h = max(256, int(tile_h * scale))
+        tile_w = max(256, int(tile_w * scale))
+        
+        # Ensure tiles are divisible by 32 (VAE requirement)
+        tile_h = (tile_h // 32) * 32
+        tile_w = (tile_w // 32) * 32
+        tile_h = max(256, tile_h)
+        tile_w = max(256, tile_w)
+    
+    return (tile_h, tile_w)
+
+
 class VideoDiffusionInfer():
     def __init__(self, config: DictConfig, debug: 'Debug',
                  encode_tiled: bool = False, encode_tile_size: Tuple[int, int] = (512, 512), 
